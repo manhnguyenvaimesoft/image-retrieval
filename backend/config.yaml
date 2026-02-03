@@ -1,0 +1,9 @@
+dataset:
+  train_path: "/home/aime/Documents/neurosearch---image-retrieval/backend/train"
+  
+storage:
+  index_file: "vector.index"
+  metadata_file: "image_paths.json"
+
+model:
+  name: "yolo26n-cls.pt" # Or yolo26n-cls.pt if you have the custom weight
