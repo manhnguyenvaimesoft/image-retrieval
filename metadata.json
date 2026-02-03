@@ -1,0 +1,5 @@
+{
+  "name": "NeuroSearch - Image Retrieval",
+  "description": "A semantic image retrieval system using YOLO embeddings and FAISS vector search. Upload an image to find visually similar images from your dataset.",
+  "requestFramePermissions": []
+}
