@@ -6,7 +6,7 @@ import shutil
 import numpy as np
 import faiss
 from typing import List, Optional
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
@@ -150,8 +150,136 @@ def get_status():
         "train_path": TRAIN_PATH
     }
 
+@app.get("/database")
+def get_database(request: Request):
+    """Return all images in the database"""
+    if not image_paths:
+        return []
+    
+    base_url = str(request.base_url)
+    results = []
+    for filename in image_paths:
+        results.append({
+            "filename": filename,
+            "url": f"{base_url}images/{filename}"
+        })
+    # Reverse to show newest first if strictly appended, 
+    # but build_index sorts by OS, so strictly speaking not chronological.
+    return results
+
+@app.get("/visualize")
+def get_visualization(request: Request):
+    """
+    Reduce vector dimensions to 3D using PCA (SVD) for visualization.
+    Returns x, y, z coordinates for every image.
+    """
+    global index, image_paths
+    
+    if index is None or index.ntotal < 3:
+        return {"error": "Not enough data to visualize (need at least 3 images)"}
+
+    # 1. Reconstruct all vectors from FAISS
+    # IndexFlatL2 stores raw vectors, so we can reconstruct them.
+    vectors = index.reconstruct_n(0, index.ntotal) # Shape: (N, D)
+    
+    # 2. Perform PCA using NumPy (SVD)
+    # Center the data
+    mean = np.mean(vectors, axis=0)
+    centered = vectors - mean
+    
+    # SVD
+    # U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    # Project to top 3 components
+    # Projection = centered @ Vt.T[:, :3]
+    try:
+        # Using numpy's SVD is robust. 
+        # We only need the top 3 principal components (columns of V, or rows of Vt)
+        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+        components = Vt[:3] # Shape (3, D)
+        projection = np.dot(centered, components.T) # Shape (N, 3)
+        
+        # Normalize to typical plotting range (-1 to 1 or similar) for cleaner charts if needed
+        # But raw PCA scores are usually fine.
+    except Exception as e:
+        print(f"PCA Error: {e}")
+        return {"error": f"Failed to compute visualization: {e}"}
+
+    # 3. Format output
+    points = []
+    base_url = str(request.base_url)
+    
+    for i, path in enumerate(image_paths):
+        points.append({
+            "filename": path,
+            "url": f"{base_url}images/{path}",
+            "x": float(projection[i, 0]),
+            "y": float(projection[i, 1]),
+            "z": float(projection[i, 2])
+        })
+        
+    return {"points": points}
+
+@app.post("/add")
+async def add_to_index(file: UploadFile = File(...)):
+    """
+    Upload a new image, save it to dataset, embed it, and add to FAISS index.
+    """
+    global index, image_paths
+
+    if index is None:
+        raise HTTPException(status_code=503, detail="Index not initialized")
+
+    # 1. Save file to TRAIN_PATH
+    filename = file.filename
+    # Handle duplicates by prepending timestamp if needed, but simple overwrite for now
+    if not filename:
+         raise HTTPException(status_code=400, detail="Filename missing")
+         
+    save_path = os.path.join(TRAIN_PATH, filename)
+    
+    try:
+        with open(save_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+
+    # 2. Extract Embedding
+    try:
+        # Load the saved image to ensure it's valid and get embedding
+        # We assume get_embedding handles path string
+        vec = get_embedding(save_path)
+        vec = vec.reshape(1, -1) # Reshape for FAISS (1, dim)
+    except Exception as e:
+        # If embedding fails, remove the file to keep state consistent
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+
+    # 3. Update Index in Memory
+    try:
+        index.add(vec)
+        image_paths.append(filename)
+    except Exception as e:
+         raise HTTPException(status_code=500, detail=f"Failed to update index: {e}")
+
+    # 4. Save Index and Metadata to Disk (Persistence)
+    try:
+        faiss.write_index(index, config["storage"]["index_file"])
+        with open(config["storage"]["metadata_file"], "w") as f:
+            json.dump(image_paths, f)
+    except Exception as e:
+        print(f"Warning: Failed to save index to disk: {e}")
+        # We don't fail the request here, but data might be lost on restart
+
+    return {
+        "status": "success", 
+        "filename": filename, 
+        "index_size": index.ntotal,
+        "message": "Image added to database successfully"
+    }
+
 @app.post("/search")
-async def search_image(k: int = Form(5), file: UploadFile = File(...)):
+async def search_image(request: Request, k: int = Form(5), file: UploadFile = File(...)):
     global index, image_paths
     
     if index is None or not image_paths:
@@ -181,6 +309,8 @@ async def search_image(k: int = Form(5), file: UploadFile = File(...)):
     distances, indices = index.search(query_vector, k=search_k)
 
     results = []
+    base_url = str(request.base_url) # Get base URL from request (e.g., http://192.168.1.35:8000/)
+
     for i, idx in enumerate(indices[0]):
         if idx == -1: continue # FAISS padding
         
@@ -188,7 +318,8 @@ async def search_image(k: int = Form(5), file: UploadFile = File(...)):
         results.append({
             "filename": filename,
             "filepath": os.path.join(TRAIN_PATH, filename),
-            "url": f"http://localhost:8000/images/{filename}",
+            # Use dynamic base_url so images load on LAN devices
+            "url": f"{base_url}images/{filename}",
             "distance": float(distances[0][i])
         })
 
@@ -201,4 +332,5 @@ async def search_image(k: int = Form(5), file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
+    # host="0.0.0.0" allows access from other devices on the network
     uvicorn.run(app, host="0.0.0.0", port=8000)
