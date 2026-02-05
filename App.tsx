@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, Search, Image as ImageIcon, Settings, Loader2, AlertCircle } from 'lucide-react';
+import { Upload, Search, Image as ImageIcon, Settings, Loader2, AlertCircle, X, ZoomIn } from 'lucide-react';
 import { API_BASE_URL, DEFAULT_K, MAX_K } from './constants';
 import { SearchResponse, SearchResult, SystemStatus } from './types';
 
@@ -14,6 +14,10 @@ export default function App() {
   const [results, setResults] = useState<SearchResult[]>([]);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  
+  // State for lightbox
+  const [zoomedImage, setZoomedImage] = useState<SearchResult | null>(null);
+  
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Check Backend Status on Mount
@@ -29,6 +33,15 @@ export default function App() {
       }
     };
     checkStatus();
+  }, []);
+
+  // Handle Escape key to close modal
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setZoomedImage(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -225,7 +238,8 @@ export default function App() {
               {results.map((result, idx) => (
                 <div 
                   key={idx} 
-                  className="group bg-surface border border-slate-700 rounded-xl overflow-hidden shadow-lg hover:shadow-primary/10 transition-all duration-300 hover:-translate-y-1"
+                  onClick={() => setZoomedImage(result)}
+                  className="group bg-surface border border-slate-700 rounded-xl overflow-hidden shadow-lg hover:shadow-primary/10 transition-all duration-300 hover:-translate-y-1 cursor-zoom-in relative"
                 >
                   <div className="aspect-square relative overflow-hidden bg-black">
                     <img 
@@ -236,7 +250,13 @@ export default function App() {
                         (e.target as HTMLImageElement).src = 'https://placehold.co/400x400?text=Image+Not+Found';
                       }}
                     />
-                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-4">
+                    
+                    {/* Hover Overlay with Zoom Icon */}
+                    <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-center justify-center z-10">
+                        <ZoomIn className="text-white w-8 h-8 drop-shadow-md transform scale-75 group-hover:scale-100 transition-transform duration-300" />
+                    </div>
+
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-4 z-20 pointer-events-none">
                       <p className="text-white text-sm font-medium truncate">{result.filename}</p>
                     </div>
                   </div>
@@ -254,6 +274,43 @@ export default function App() {
           )}
         </div>
       </main>
+
+      {/* Lightbox / Modal */}
+      {zoomedImage && (
+        <div 
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/95 backdrop-blur-sm p-4 animate-in fade-in duration-200"
+          onClick={() => setZoomedImage(null)}
+        >
+          {/* Close Button */}
+          <button 
+            onClick={() => setZoomedImage(null)}
+            className="absolute top-6 right-6 p-2 rounded-full bg-slate-800/50 hover:bg-slate-700 text-white/80 hover:text-white transition-colors z-50"
+          >
+            <X className="w-8 h-8" />
+          </button>
+          
+          <div 
+            className="relative flex flex-col items-center max-w-full"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <img 
+              src={zoomedImage.url} 
+              alt={zoomedImage.filename}
+              className="max-w-full max-h-[85vh] object-contain rounded-lg shadow-2xl border border-slate-800/50"
+            />
+            
+            <div className="mt-6 bg-slate-900/90 backdrop-blur-md px-8 py-4 rounded-2xl border border-slate-700 text-center shadow-xl">
+              <p className="text-white text-lg font-medium tracking-wide">{zoomedImage.filename}</p>
+              <div className="flex items-center justify-center gap-2 mt-1">
+                <span className="text-slate-400 text-sm">Similarity Distance:</span>
+                <span className="text-primary font-mono font-bold bg-primary/10 px-2 rounded">
+                  {zoomedImage.distance.toFixed(6)}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

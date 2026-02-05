@@ -6,7 +6,7 @@ import shutil
 import numpy as np
 import faiss
 from typing import List, Optional
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
@@ -36,6 +36,9 @@ if not os.path.exists(CONFIG_PATH):
 else:
     with open(CONFIG_PATH, "r") as f:
         config = yaml.safe_load(f)
+        # Storage is always set to default.
+        project_base_path = config.get("project", {}).get("base_path", "./projects/default_project")
+        config["storage"] = {"index_file": f"{project_base_path}/vector.index", "metadata_file": f"{project_base_path}/image_paths.json"}
 
 # Global Variables
 index: Optional[faiss.IndexFlatL2] = None
@@ -53,12 +56,12 @@ app.mount("/images", StaticFiles(directory=TRAIN_PATH), name="images")
 
 def load_model():
     global model
-    print(f"Loading YOLO model: {config['model']['name']}...")
+    print(f"Loading YOLO model: {config['model']['path']}...")
     try:
-        model = YOLO(config['model']['name'])
+        model = YOLO(config['model']['path'])
     except Exception as e:
         print(f"Error loading model: {e}. Trying generic 'yolov8n-cls.pt'")
-        model = YOLO('yolov8n-cls.pt')
+        model = YOLO('./weights/yolov8n-cls.pt')
 
 def get_embedding(source):
     """
@@ -81,7 +84,16 @@ def build_index():
         print(f"Warning: Train path {TRAIN_PATH} does not exist.")
         return
 
-    files = [f for f in os.listdir(TRAIN_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+    # files = [f for f in os.listdir(TRAIN_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+    # Instead of just browsing within a folder, use recursive browsing to retrieve all images in subfolders.
+    files = []
+    for root, _, filenames in os.walk(TRAIN_PATH):
+        for filename in filenames:
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                # Get relative path to TRAIN_PATH
+                relative_path = os.path.relpath(os.path.join(root, filename), TRAIN_PATH)
+                files.append(relative_path)
+
     if not files:
         print("No images found in train path.")
         return
@@ -151,7 +163,7 @@ def get_status():
     }
 
 @app.post("/search")
-async def search_image(k: int = Form(5), file: UploadFile = File(...)):
+async def search_image(request: Request, k: int = Form(5), file: UploadFile = File(...)):
     global index, image_paths
     
     if index is None or not image_paths:
@@ -181,6 +193,8 @@ async def search_image(k: int = Form(5), file: UploadFile = File(...)):
     distances, indices = index.search(query_vector, k=search_k)
 
     results = []
+    base_url = str(request.base_url) # Get base URL from request (e.g., http://192.168.1.35:8000/)
+
     for i, idx in enumerate(indices[0]):
         if idx == -1: continue # FAISS padding
         
@@ -188,7 +202,8 @@ async def search_image(k: int = Form(5), file: UploadFile = File(...)):
         results.append({
             "filename": filename,
             "filepath": os.path.join(TRAIN_PATH, filename),
-            "url": f"http://localhost:8000/images/{filename}",
+            # Use dynamic base_url so images load on LAN devices
+            "url": f"{base_url}images/{filename}",
             "distance": float(distances[0][i])
         })
 
@@ -199,6 +214,11 @@ async def search_image(k: int = Form(5), file: UploadFile = File(...)):
         "query_time": elapsed
     }
 
+@app.get("/")
+def home():
+    return {"message": "Welcome to the NeuroSearch API"}
+
 if __name__ == "__main__":
     import uvicorn
+    # host="0.0.0.0" allows access from other devices on the network
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,9 +1,17 @@
 dataset:
-  train_path: "/home/aime/Documents/neurosearch---image-retrieval/backend/train"
-  
-storage:
-  index_file: "vector.index"
-  metadata_file: "image_paths.json"
+  # train_path: "/home/aime/Documents/neurosearch---image-retrieval/backend/train"
+  # The path to the images to create the database.
+  train_path: "/home/aime/Documents/line-data-infordio"
+
+project:
+  name: "infordio_line"
+  base_path: "./projects/infordio_line"
+
+# storage:
+#   # index_file: "vector.index"
+#   index_file: "vector_infordio_line.index"
+#   # metadata_file: "image_paths.json"
+#   metadata_file: "image_line_infordio_paths.json"
 
 model:
-  name: "yolo26n-cls.pt" # Or yolo26n-cls.pt if you have the custom weight
+  path: "./weights/yolo26x-cls.pt" # Or yolo26n-cls.pt if you have the custom weight
