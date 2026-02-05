@@ -1,3 +1,4 @@
-train
 __pycache__/
-projects/*
+projects_data/
+uploads/
+projects.json

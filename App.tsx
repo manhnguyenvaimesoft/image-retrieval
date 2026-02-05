@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Upload, Search, Image as ImageIcon, Settings, Loader2, AlertCircle, X, ZoomIn, Database, Plus, CheckCircle2, Box, Grid, LayoutDashboard } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Upload, Search, Image as ImageIcon, Settings, Loader2, AlertCircle, X, ZoomIn, Database, Plus, CheckCircle2, Box, Grid, FolderPlus, ChevronDown, Layers, Trash2, Star, Layout } from 'lucide-react';
 import { API_BASE_URL, DEFAULT_K, MAX_K } from './constants';
-import { SearchResponse, SearchResult, SystemStatus } from './types';
+import { SearchResponse, SearchResult, SystemStatus, Project, IndexingStatus } from './types';
 
 // Utility for class names
 const cn = (...classes: (string | undefined | null | false)[]) => classes.filter(Boolean).join(' ');
@@ -9,16 +9,30 @@ const cn = (...classes: (string | undefined | null | false)[]) => classes.filter
 // Define tabs
 type Tab = 'search' | 'gallery' | 'visualization';
 
+// Extend Project type locally to include new field if backend sends it
+interface ExtendedProject extends Project {
+    is_default?: boolean;
+}
+
 // --- Components ---
 
 // 3D Visualization Component using Plotly via global window object
-const VectorSpace = () => {
+const VectorSpace = ({ versionKey, onPointClick }: { versionKey: number, onPointClick: (item: any) => void }) => {
   const [data, setData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const plotDivRef = useRef<HTMLDivElement>(null);
+  
+  // Use a ref for the callback to prevent the main useEffect from re-running 
+  // when the parent component re-renders (e.g., due to polling status).
+  const onPointClickRef = useRef(onPointClick);
 
   useEffect(() => {
+    onPointClickRef.current = onPointClick;
+  }, [onPointClick]);
+
+  useEffect(() => {
+    setLoading(true);
     fetch(`${API_BASE_URL}/visualize`)
       .then(res => {
         if (!res.ok) throw new Error(`Server Error: ${res.statusText}`);
@@ -30,10 +44,10 @@ const VectorSpace = () => {
       })
       .catch(err => {
         console.error("Visualization fetch error:", err);
-        setError("Could not load visualization. Is the backend running?");
+        setError("Could not load visualization. Select a project.");
       })
       .finally(() => setLoading(false));
-  }, []);
+  }, [versionKey]); // Refetch when versionKey changes
 
   useEffect(() => {
     if (!loading && data.length > 0 && plotDivRef.current && (window as any).Plotly) {
@@ -66,39 +80,67 @@ const VectorSpace = () => {
           bgcolor: 'rgba(0,0,0,0)' // Transparent background
         },
         showlegend: false,
-        autosize: true
+        autosize: true,
+        hovermode: 'closest',
+        // Critical: uirevision keeps the user interaction state (zoom, rotation) 
+        // intact across updates as long as this value doesn't change.
+        uirevision: 'true' 
       };
 
       const config = { responsive: true, displayModeBar: false };
 
-      Plotly.newPlot(plotDivRef.current, [trace], layout, config);
+      // Use Plotly.react for efficient updates instead of newPlot which destroys the DOM
+      Plotly.react(plotDivRef.current, [trace], layout, config);
       
-      // Cleanup
-      return () => Plotly.purge(plotDivRef.current);
+      // Attach Click Event
+      const plotEl = plotDivRef.current as any;
+      
+      // Remove old listeners to prevent duplicates if this effect re-runs
+      plotEl.removeAllListeners('plotly_click');
+      
+      plotEl.on('plotly_click', (dataEvent: any) => {
+          if (dataEvent.points && dataEvent.points.length > 0) {
+              const pointIndex = dataEvent.points[0].pointNumber;
+              const pointData = data[pointIndex];
+              if (pointData) {
+                  // Use the ref to call the latest callback
+                  onPointClickRef.current({
+                      filename: pointData.filename,
+                      url: pointData.url,
+                      distance: 0, 
+                      filepath: pointData.filename 
+                  });
+              }
+          }
+      });
+
+      // We do not strictly purge here on unmount of effect to avoid flickering during quick updates,
+      // but if the component is fully removed from DOM, React handles the cleanup.
     }
-  }, [loading, data]);
+  }, [loading, data]); // REMOVED onPointClick from dependencies to stop re-plotting on parent render
 
   if (loading) return <div className="h-96 flex items-center justify-center text-primary"><Loader2 className="w-8 h-8 animate-spin" /></div>;
   if (error) return <div className="h-96 flex items-center justify-center text-rose-400"><AlertCircle className="w-6 h-6 mr-2" /> {error}</div>;
-  if (data.length === 0) return <div className="h-96 flex items-center justify-center text-slate-500">Not enough data to visualize.</div>;
+  if (data.length === 0) return <div className="h-96 flex items-center justify-center text-slate-500">Not enough data to visualize (min 3 images).</div>;
 
   return (
     <div className="w-full h-[600px] border border-slate-700 rounded-2xl overflow-hidden bg-black/40 relative">
       <div className="absolute top-4 left-4 z-10 pointer-events-none">
          <h3 className="text-white font-bold text-lg bg-black/50 px-2 rounded">Semantic Vector Space</h3>
-         <p className="text-slate-400 text-xs bg-black/50 px-2 rounded">PCA Projection (3D)</p>
+         <p className="text-slate-400 text-xs bg-black/50 px-2 rounded">PCA Projection (3D) - Click point to view image</p>
       </div>
-      <div ref={plotDivRef} className="w-full h-full" />
+      <div ref={plotDivRef} className="w-full h-full cursor-pointer" />
     </div>
   );
 };
 
-const GalleryGrid = ({ onZoom }: { onZoom: (item: any) => void }) => {
+const GalleryGrid = ({ onZoom, versionKey }: { onZoom: (item: any) => void, versionKey: number }) => {
   const [images, setImages] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string|null>(null);
 
   useEffect(() => {
+    setLoading(true);
     fetch(`${API_BASE_URL}/database`)
       .then(res => {
         if (!res.ok) throw new Error("Failed to fetch gallery");
@@ -110,7 +152,7 @@ const GalleryGrid = ({ onZoom }: { onZoom: (item: any) => void }) => {
         setError("Failed to load images");
       })
       .finally(() => setLoading(false));
-  }, []);
+  }, [versionKey]);
 
   if (loading) return <div className="py-20 flex justify-center"><Loader2 className="w-8 h-8 animate-spin text-primary" /></div>;
   if (error) return <div className="py-20 flex justify-center text-rose-400">{error}</div>;
@@ -142,18 +184,35 @@ const GalleryGrid = ({ onZoom }: { onZoom: (item: any) => void }) => {
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('search');
 
+  // --- Project State ---
+  const [projects, setProjects] = useState<ExtendedProject[]>([]);
+  const [currentProject, setCurrentProject] = useState<ExtendedProject | null>(null);
+  const [isProjectDropdownOpen, setIsProjectDropdownOpen] = useState(false);
+  
+  // --- Create Project State ---
+  const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectFiles, setNewProjectFiles] = useState<FileList | null>(null);
+  const [isCreatingProject, setIsCreatingProject] = useState(false);
+  
+  // --- Indexing/Loading State ---
+  const [indexingStatus, setIndexingStatus] = useState<IndexingStatus | null>(null);
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [dataVersion, setDataVersion] = useState(0); // Used to force refresh components
+
+  // --- Search State ---
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [topK, setTopK] = useState<number>(DEFAULT_K);
   const [isSearching, setIsSearching] = useState(false);
   const [results, setResults] = useState<SearchResult[]>([]);
-  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   
-  // State for lightbox
+  // --- Lightbox ---
   const [zoomedImage, setZoomedImage] = useState<SearchResult | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
 
-  // State for Upload/Add Modal
+  // --- Upload/Add Modal ---
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadPreview, setUploadPreview] = useState<string | null>(null);
@@ -163,35 +222,108 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadInputRef = useRef<HTMLInputElement>(null);
 
-  // Check Backend Status on Mount
+  // --- Poll for System Status ---
   useEffect(() => {
-    const checkStatus = async () => {
-      try {
-        const res = await fetch(`${API_BASE_URL}/status`);
-        if (!res.ok) throw new Error("Failed to connect to backend");
-        const data = await res.json();
-        setSystemStatus(data);
-      } catch (err) {
-        console.error("Backend status check failed:", err);
-        setSystemStatus({ status: 'error', index_size: 0, message: 'Backend unreachable' });
-      }
-    };
-    checkStatus();
-  }, [activeTab]); // Re-check when switching tabs sometimes helps
+    fetchProjects();
+    const interval = setInterval(async () => {
+       try {
+         // Check System Status
+         const resStatus = await fetch(`${API_BASE_URL}/status`);
+         const statusData = await resStatus.json();
+         setSystemStatus(statusData);
 
-  // Handle Escape key to close modals
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setZoomedImage(null);
-        if (uploadStatus !== 'success' && !isUploading) {
-            setIsUploadModalOpen(false);
+         // Check Indexing Process
+         if (statusData.status === 'indexing') {
+            const resIndex = await fetch(`${API_BASE_URL}/indexing_status`);
+            const indexData = await resIndex.json();
+            setIndexingStatus(indexData);
+         } else {
+            // If we were indexing and now we are not, refresh data
+            if (indexingStatus?.is_indexing) {
+                setIndexingStatus(null);
+                fetchProjects();
+                setDataVersion(v => v + 1); // Refresh gallery
+            }
+         }
+       } catch (e) {
+         console.error("Polling error", e);
+       }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [indexingStatus?.is_indexing]);
+
+  const fetchProjects = async () => {
+    try {
+        const res = await fetch(`${API_BASE_URL}/projects`);
+        const data = await res.json();
+        setProjects(data);
+    } catch (e) { console.error("Failed to load projects"); }
+  };
+
+  // --- Handlers ---
+
+  const handleCreateProject = async () => {
+    if (!newProjectName || !newProjectFiles || newProjectFiles.length === 0) return;
+    
+    setIsCreatingProject(true);
+    try {
+        const formData = new FormData();
+        formData.append('name', newProjectName);
+        
+        for (let i = 0; i < newProjectFiles.length; i++) {
+            formData.append('files', newProjectFiles[i]);
         }
-      } 
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [uploadStatus, isUploading]);
+        
+        const res = await fetch(`${API_BASE_URL}/projects/create`, { method: 'POST', body: formData });
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || "Failed to create project");
+        }
+        
+        // Refresh project list immediately
+        fetchProjects();
+        setIsCreateModalOpen(false);
+        setNewProjectName("");
+        setNewProjectFiles(null);
+        
+    } catch (err: any) {
+        alert(err.message);
+    } finally {
+        setIsCreatingProject(false);
+    }
+  };
+
+  const handleSwitchProject = async (projectId: string) => {
+    setIsProjectDropdownOpen(false);
+    try {
+        const formData = new FormData();
+        formData.append('project_id', projectId);
+        await fetch(`${API_BASE_URL}/projects/switch`, { method: 'POST', body: formData });
+        
+        // Find project object
+        const p = projects.find(proj => proj.id === projectId);
+        setCurrentProject(p || null);
+        
+        // Clear current results
+        setResults([]);
+        setSelectedFile(null);
+        setPreviewUrl(null);
+        setDataVersion(v => v + 1); // Refresh views
+        
+    } catch (e) { console.error(e); }
+  };
+
+  const handleSetDefault = async (projectId: string, e: React.MouseEvent) => {
+      e.stopPropagation(); // Prevent switching logic
+      try {
+          const formData = new FormData();
+          formData.append('project_id', projectId);
+          const res = await fetch(`${API_BASE_URL}/projects/set_default`, { method: 'POST', body: formData });
+          if(res.ok) {
+              fetchProjects(); // Refresh list to see star update
+          }
+      } catch(e) { console.error(e); }
+  };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -234,6 +366,7 @@ export default function App() {
       // Update system status locally
       setSystemStatus(prev => prev ? ({...prev, index_size: data.index_size}) : null);
       setUploadStatus('success');
+      setDataVersion(v => v + 1); // Trigger gallery refresh
       
       // Clear selection after short delay
       setTimeout(() => {
@@ -241,7 +374,6 @@ export default function App() {
           setUploadFile(null);
           setUploadPreview(null);
           setUploadStatus('idle');
-          // If on gallery view, we might want to refresh, but simple state change is okay for now
       }, 1500);
 
     } catch (err) {
@@ -252,8 +384,47 @@ export default function App() {
     }
   };
 
+  const handleDeleteImage = async () => {
+      if (!zoomedImage) return;
+      if (!window.confirm(`Are you sure you want to remove "${zoomedImage.filename}" from the database? The file will remain on your disk.`)) return;
+
+      setIsDeleting(true);
+      const formData = new FormData();
+      formData.append('filename', zoomedImage.filename);
+
+      try {
+          const res = await fetch(`${API_BASE_URL}/delete`, {
+              method: 'POST',
+              body: formData
+          });
+
+          if (!res.ok) throw new Error("Delete failed");
+
+          const data = await res.json();
+          // Update status
+          setSystemStatus(prev => prev ? ({...prev, index_size: data.index_size}) : null);
+          setDataVersion(v => v + 1); // Refresh all views
+          setZoomedImage(null); // Close lightbox
+          
+          // Optional: If the deleted image was in search results, remove it
+          setResults(prev => prev.filter(r => r.filename !== zoomedImage.filename));
+
+      } catch (err) {
+          alert("Failed to delete image");
+          console.error(err);
+      } finally {
+          setIsDeleting(false);
+      }
+  };
+
   const handleSearch = async () => {
     if (!selectedFile) return;
+    
+    // Safety check
+    if (systemStatus?.current_project === "None" || !systemStatus?.current_project) {
+        setError("Please select a project first.");
+        return;
+    }
 
     setIsSearching(true);
     setError(null);
@@ -282,49 +453,175 @@ export default function App() {
     }
   };
 
-  const triggerFileUpload = () => {
-    fileInputRef.current?.click();
-  };
+  // Handle Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (zoomedImage) setZoomedImage(null);
+        else if (uploadStatus !== 'success' && !isUploading) {
+            setIsUploadModalOpen(false);
+            if (!isCreatingProject) setIsCreateModalOpen(false);
+        }
+      } 
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [uploadStatus, isUploading, isCreatingProject, zoomedImage]);
+
+  // Memoize the click handler to prevent unnecessary re-renders of VectorSpace
+  const handlePointClick = useCallback((img: any) => {
+    setZoomedImage(img);
+  }, []);
+
+  // Determine if a project is loaded
+  const isProjectLoaded = systemStatus?.current_project && systemStatus.current_project !== "None";
 
   return (
     <div className="min-h-screen bg-dark text-slate-200 font-sans selection:bg-primary selection:text-white pb-10">
+      
+      {/* Indexing Overlay */}
+      {systemStatus?.status === 'indexing' && indexingStatus && (
+        <div className="fixed inset-0 z-[60] bg-black/80 backdrop-blur-sm flex items-center justify-center">
+            <div className="bg-surface border border-slate-700 p-8 rounded-2xl max-w-lg w-full shadow-2xl animate-in zoom-in-95 fade-in">
+                <h3 className="text-xl font-bold mb-2 flex items-center gap-2">
+                    <Loader2 className="w-6 h-6 animate-spin text-primary" />
+                    Creating Database...
+                </h3>
+                <p className="text-slate-400 mb-6">{indexingStatus.current_step}</p>
+                
+                <div className="w-full bg-slate-700 rounded-full h-4 mb-2 overflow-hidden">
+                    <div 
+                        className="bg-primary h-full transition-all duration-300 ease-out" 
+                        style={{ width: `${indexingStatus.progress}%` }}
+                    />
+                </div>
+                <div className="flex justify-between text-sm text-slate-400">
+                    <span>{indexingStatus.processed_files} / {indexingStatus.total_files} files</span>
+                    <span>{indexingStatus.progress}%</span>
+                </div>
+            </div>
+        </div>
+      )}
+
       {/* Header */}
       <header className="border-b border-slate-800 bg-dark/50 backdrop-blur-md sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="bg-primary/20 p-2 rounded-lg">
-              <Search className="w-6 h-6 text-primary" />
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+                <div className="bg-primary/20 p-2 rounded-lg">
+                <Search className="w-6 h-6 text-primary" />
+                </div>
+                <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-primary to-purple-400 hidden sm:block">
+                NeuroSearch
+                </h1>
             </div>
-            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-primary to-purple-400">
-              NeuroSearch
-            </h1>
+
+            {/* Project Switcher Dropdown */}
+            <div className="relative">
+                <button 
+                    onClick={() => setIsProjectDropdownOpen(!isProjectDropdownOpen)}
+                    className={cn(
+                        "flex items-center gap-2 px-3 py-1.5 rounded-lg border text-sm font-medium transition-colors",
+                        isProjectLoaded 
+                            ? "bg-slate-800 hover:bg-slate-700 border-slate-700" 
+                            : "bg-rose-500/10 border-rose-500/30 text-rose-400 animate-pulse"
+                    )}
+                >
+                    <Layers className="w-4 h-4" />
+                    <span className="max-w-[150px] truncate">
+                        {isProjectLoaded ? systemStatus?.current_project : "Select Project"}
+                    </span>
+                    <ChevronDown className="w-3 h-3 opacity-70" />
+                </button>
+
+                {isProjectDropdownOpen && (
+                    <div className="absolute top-full left-0 mt-2 w-72 bg-surface border border-slate-700 rounded-xl shadow-2xl overflow-hidden z-50 animate-in fade-in zoom-in-95 duration-100">
+                        <div className="p-2 border-b border-slate-700/50">
+                            <span className="text-xs font-semibold text-slate-500 px-2 uppercase tracking-wider">Projects</span>
+                        </div>
+                        <div className="max-h-64 overflow-y-auto">
+                            {projects.length === 0 ? (
+                                <div className="p-4 text-center text-xs text-slate-500">
+                                    No projects found. Create one to start.
+                                </div>
+                            ) : (
+                                projects.map(p => (
+                                    <div
+                                        key={p.id}
+                                        className={cn(
+                                            "w-full px-4 py-2 text-sm flex items-center justify-between group cursor-pointer transition-colors border-l-2",
+                                            systemStatus?.current_project === p.name 
+                                                ? "bg-primary/5 border-primary text-white" 
+                                                : "border-transparent text-slate-300 hover:bg-slate-700/50"
+                                        )}
+                                        onClick={() => handleSwitchProject(p.id)}
+                                    >
+                                        <div className="flex items-center gap-2 overflow-hidden">
+                                            {p.is_default && <Star className="w-3 h-3 text-amber-400 fill-amber-400" />}
+                                            <span className="truncate">{p.name}</span>
+                                        </div>
+                                        
+                                        <div className="flex items-center gap-2">
+                                            {systemStatus?.current_project === p.name && <CheckCircle2 className="w-4 h-4 text-primary" />}
+                                            <button 
+                                                title="Set as Default"
+                                                onClick={(e) => handleSetDefault(p.id, e)}
+                                                className={cn(
+                                                    "p-1 rounded hover:bg-slate-600 transition-colors",
+                                                    p.is_default ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                                                )}
+                                            >
+                                                <Star className={cn("w-3 h-3", p.is_default ? "text-amber-400 fill-amber-400" : "text-slate-500")} />
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                        <div className="p-2 border-t border-slate-700/50 bg-slate-800/50">
+                            <button 
+                                onClick={() => { setIsProjectDropdownOpen(false); setIsCreateModalOpen(true); }}
+                                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-primary hover:text-white hover:bg-primary/20 rounded-lg transition-colors"
+                            >
+                                <Plus className="w-3 h-3" /> New Project
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </div>
           </div>
           
           {/* Navigation Tabs */}
           <nav className="hidden md:flex items-center gap-1 bg-surface/50 p-1 rounded-xl border border-slate-700/50">
             <button 
               onClick={() => setActiveTab('search')}
+              disabled={!isProjectLoaded}
               className={cn(
                 "px-4 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center gap-2",
-                activeTab === 'search' ? "bg-primary text-white shadow-lg" : "text-slate-400 hover:text-white hover:bg-slate-700/50"
+                activeTab === 'search' ? "bg-primary text-white shadow-lg" : "text-slate-400 hover:text-white hover:bg-slate-700/50",
+                !isProjectLoaded && "opacity-50 cursor-not-allowed"
               )}
             >
               <Search className="w-4 h-4" /> Search
             </button>
             <button 
               onClick={() => setActiveTab('gallery')}
+              disabled={!isProjectLoaded}
               className={cn(
                 "px-4 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center gap-2",
-                activeTab === 'gallery' ? "bg-primary text-white shadow-lg" : "text-slate-400 hover:text-white hover:bg-slate-700/50"
+                activeTab === 'gallery' ? "bg-primary text-white shadow-lg" : "text-slate-400 hover:text-white hover:bg-slate-700/50",
+                !isProjectLoaded && "opacity-50 cursor-not-allowed"
               )}
             >
               <Grid className="w-4 h-4" /> Gallery
             </button>
             <button 
               onClick={() => setActiveTab('visualization')}
+              disabled={!isProjectLoaded}
               className={cn(
                 "px-4 py-1.5 rounded-lg text-sm font-medium transition-all flex items-center gap-2",
-                activeTab === 'visualization' ? "bg-primary text-white shadow-lg" : "text-slate-400 hover:text-white hover:bg-slate-700/50"
+                activeTab === 'visualization' ? "bg-primary text-white shadow-lg" : "text-slate-400 hover:text-white hover:bg-slate-700/50",
+                !isProjectLoaded && "opacity-50 cursor-not-allowed"
               )}
             >
               <Box className="w-4 h-4" /> 3D Space
@@ -335,7 +632,8 @@ export default function App() {
              {/* Add Button */}
              <button 
                 onClick={() => setIsUploadModalOpen(true)}
-                className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition-colors text-xs font-medium"
+                disabled={!isProjectLoaded}
+                className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition-colors text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed"
              >
                 <Plus className="w-4 h-4" />
                 Add Image
@@ -343,12 +641,13 @@ export default function App() {
 
             <div className="h-4 w-px bg-slate-700 mx-2 hidden sm:block"></div>
 
-            {systemStatus?.status === 'ready' ? (
+            {/* Status Indicator */}
+            {systemStatus?.status === 'ready' || systemStatus?.status === 'indexing' ? (
               <div className="flex items-center gap-2 text-emerald-400">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                 <span className="hidden sm:inline">Index Active</span> 
                 <span className="font-mono bg-emerald-400/10 px-1.5 rounded">
-                  {systemStatus.index_size}
+                  {systemStatus.index_size !== undefined ? systemStatus.index_size.toLocaleString() : '...'}
                 </span>
               </div>
             ) : systemStatus?.status === 'error' ? (
@@ -356,6 +655,11 @@ export default function App() {
                  <AlertCircle className="w-4 h-4" />
                  Backend Offline
               </div>
+            ) : !isProjectLoaded ? (
+                <div className="flex items-center gap-2 text-slate-500">
+                   <Layout className="w-3 h-3" />
+                   No Project
+                </div>
             ) : (
               <div className="flex items-center gap-2 text-amber-400">
                 <Loader2 className="w-3 h-3 animate-spin" />
@@ -366,7 +670,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* Mobile Nav (visible only on small screens) */}
+      {/* Mobile Nav */}
       <div className="md:hidden flex p-2 justify-center gap-2 border-b border-slate-800 bg-surface">
          <button onClick={() => setActiveTab('search')} className={cn("flex-1 py-2 text-xs font-medium rounded-lg text-center", activeTab === 'search' ? 'bg-slate-700 text-white' : 'text-slate-400')}>Search</button>
          <button onClick={() => setActiveTab('gallery')} className={cn("flex-1 py-2 text-xs font-medium rounded-lg text-center", activeTab === 'gallery' ? 'bg-slate-700 text-white' : 'text-slate-400')}>Gallery</button>
@@ -375,184 +679,215 @@ export default function App() {
 
       <main className="max-w-7xl mx-auto px-4 py-8">
         
-        {/* VIEW: SEARCH */}
-        {activeTab === 'search' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 animate-in fade-in duration-500">
-            {/* Left Column: Controls & Input */}
-            <div className="lg:col-span-4 space-y-6">
-              
-              {/* Upload Card */}
-              <div className="bg-surface rounded-2xl p-6 border border-slate-700 shadow-xl">
-                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                  <ImageIcon className="w-5 h-5 text-slate-400" />
-                  Query Image
-                </h2>
-
-                <div 
-                  onClick={triggerFileUpload}
-                  className={cn(
-                    "border-2 border-dashed rounded-xl h-64 flex flex-col items-center justify-center cursor-pointer transition-all duration-300 group relative overflow-hidden",
-                    previewUrl ? "border-primary/50 bg-dark" : "border-slate-600 hover:border-primary hover:bg-slate-800/50"
-                  )}
-                >
-                  <input 
-                    type="file" 
-                    ref={fileInputRef} 
-                    className="hidden" 
-                    accept="image/*" 
-                    onChange={handleFileSelect} 
-                  />
-                  
-                  {previewUrl ? (
-                    <img 
-                      src={previewUrl} 
-                      alt="Query" 
-                      className="w-full h-full object-contain p-2 z-10" 
-                    />
-                  ) : (
-                    <div className="text-center p-4 z-10">
-                      <div className="w-12 h-12 rounded-full bg-slate-700 flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
-                        <Upload className="w-6 h-6 text-slate-300" />
-                      </div>
-                      <p className="text-slate-300 font-medium">Click to upload image</p>
-                      <p className="text-slate-500 text-xs mt-1">PNG, JPG support</p>
-                    </div>
-                  )}
+        {/* VIEW: NO PROJECT LOADED */}
+        {!isProjectLoaded ? (
+            <div className="min-h-[60vh] flex flex-col items-center justify-center animate-in fade-in zoom-in-95">
+                <div className="w-24 h-24 bg-slate-800 rounded-3xl flex items-center justify-center mb-6 border border-slate-700 shadow-xl">
+                    <FolderPlus className="w-12 h-12 text-primary" />
                 </div>
-              </div>
-
-              {/* Settings Card */}
-              <div className="bg-surface rounded-2xl p-6 border border-slate-700 shadow-xl">
-                <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                  <Settings className="w-5 h-5 text-slate-400" />
-                  Parameters
-                </h2>
-                
-                <div className="space-y-4">
-                  <div>
-                    <div className="flex justify-between mb-2">
-                      <label className="text-sm text-slate-400">Top K Results</label>
-                      <span className="text-sm font-mono text-primary font-bold">{topK}</span>
-                    </div>
-                    <input 
-                      type="range" 
-                      min="1" 
-                      max={MAX_K} 
-                      value={topK} 
-                      onChange={(e) => setTopK(parseInt(e.target.value))}
-                      className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-primary hover:accent-secondary"
-                    />
-                  </div>
-
-                  <button
-                    onClick={handleSearch}
-                    disabled={!selectedFile || isSearching || systemStatus?.status !== 'ready'}
-                    className="w-full py-3 px-4 bg-primary hover:bg-secondary disabled:opacity-50 disabled:cursor-not-allowed rounded-xl font-semibold text-white transition-all flex items-center justify-center gap-2 shadow-lg shadow-primary/25"
-                  >
-                    {isSearching ? (
-                      <>
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                        Searching...
-                      </>
-                    ) : (
-                      <>
-                        <Search className="w-5 h-5" />
-                        Find Similar Images
-                      </>
-                    )}
-                  </button>
-                  
-                  {error && (
-                    <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-lg text-rose-400 text-sm flex items-start gap-2">
-                      <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-                      {error}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Right Column: Results */}
-            <div className="lg:col-span-8">
-              <div className="flex items-center justify-between mb-6">
-                <h2 className="text-2xl font-bold">Results</h2>
-                {results.length > 0 && (
-                  <span className="text-slate-400 text-sm">Found {results.length} matches</span>
-                )}
-              </div>
-
-              {results.length === 0 ? (
-                <div className="h-[500px] border border-slate-800 rounded-2xl flex flex-col items-center justify-center text-slate-500 bg-surface/30">
-                  <Search className="w-16 h-16 mb-4 opacity-20" />
-                  <p>Upload an image and hit search to see results</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-3 gap-6">
-                  {results.map((result, idx) => (
-                    <div 
-                      key={idx} 
-                      onClick={() => setZoomedImage(result)}
-                      className="group bg-surface border border-slate-700 rounded-xl overflow-hidden shadow-lg hover:shadow-primary/10 transition-all duration-300 hover:-translate-y-1 cursor-zoom-in relative"
+                <h2 className="text-2xl font-bold mb-2">Welcome to NeuroSearch</h2>
+                <p className="text-slate-400 max-w-md text-center mb-8">
+                    To get started, please create a new project with your image dataset or select an existing one from the menu.
+                </p>
+                <div className="flex gap-4">
+                    <button 
+                        onClick={() => setIsCreateModalOpen(true)}
+                        className="px-6 py-3 bg-primary hover:bg-secondary text-white rounded-xl font-semibold shadow-lg shadow-primary/25 transition-all flex items-center gap-2"
                     >
-                      <div className="aspect-square relative overflow-hidden bg-black">
-                        <img 
-                          src={result.url} 
-                          alt={result.filename}
-                          className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
-                          onError={(e) => {
-                            (e.target as HTMLImageElement).src = 'https://placehold.co/400x400?text=Image+Not+Found';
-                          }}
+                        <Plus className="w-5 h-5" /> Create Project
+                    </button>
+                    {projects.length > 0 && (
+                        <button 
+                            onClick={() => setIsProjectDropdownOpen(true)}
+                            className="px-6 py-3 bg-slate-800 hover:bg-slate-700 text-white rounded-xl font-semibold border border-slate-700 transition-all flex items-center gap-2"
+                        >
+                            <Layers className="w-5 h-5" /> Select Existing
+                        </button>
+                    )}
+                </div>
+            </div>
+        ) : (
+            <>
+                {/* VIEW: SEARCH */}
+                {activeTab === 'search' && (
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 animate-in fade-in duration-500">
+                    {/* Left Column: Controls & Input */}
+                    <div className="lg:col-span-4 space-y-6">
+                    
+                    {/* Upload Card */}
+                    <div className="bg-surface rounded-2xl p-6 border border-slate-700 shadow-xl">
+                        <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                        <ImageIcon className="w-5 h-5 text-slate-400" />
+                        Query Image
+                        </h2>
+
+                        <div 
+                        onClick={() => fileInputRef.current?.click()}
+                        className={cn(
+                            "border-2 border-dashed rounded-xl h-64 flex flex-col items-center justify-center cursor-pointer transition-all duration-300 group relative overflow-hidden",
+                            previewUrl ? "border-primary/50 bg-dark" : "border-slate-600 hover:border-primary hover:bg-slate-800/50"
+                        )}
+                        >
+                        <input 
+                            type="file" 
+                            ref={fileInputRef} 
+                            className="hidden" 
+                            accept="image/*" 
+                            onChange={handleFileSelect} 
                         />
                         
-                        {/* Hover Overlay with Zoom Icon */}
-                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-center justify-center z-10">
-                            <ZoomIn className="text-white w-8 h-8 drop-shadow-md transform scale-75 group-hover:scale-100 transition-transform duration-300" />
+                        {previewUrl ? (
+                            <img 
+                            src={previewUrl} 
+                            alt="Query" 
+                            className="w-full h-full object-contain p-2 z-10" 
+                            />
+                        ) : (
+                            <div className="text-center p-4 z-10">
+                            <div className="w-12 h-12 rounded-full bg-slate-700 flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
+                                <Upload className="w-6 h-6 text-slate-300" />
+                            </div>
+                            <p className="text-slate-300 font-medium">Click to upload image</p>
+                            <p className="text-slate-500 text-xs mt-1">PNG, JPG support</p>
+                            </div>
+                        )}
                         </div>
-
-                        <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-4 z-20 pointer-events-none">
-                          <p className="text-white text-sm font-medium truncate">{result.filename}</p>
-                        </div>
-                      </div>
-                      <div className="p-3 border-t border-slate-700 bg-slate-800/50">
-                        <div className="flex justify-between items-center text-xs">
-                          <span className="text-slate-400">Distance (L2)</span>
-                          <span className="font-mono text-primary bg-primary/10 px-2 py-0.5 rounded">
-                            {result.distance.toFixed(4)}
-                          </span>
-                        </div>
-                      </div>
                     </div>
-                  ))}
+
+                    {/* Settings Card */}
+                    <div className="bg-surface rounded-2xl p-6 border border-slate-700 shadow-xl">
+                        <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                        <Settings className="w-5 h-5 text-slate-400" />
+                        Parameters
+                        </h2>
+                        
+                        <div className="space-y-4">
+                        <div>
+                            <div className="flex justify-between mb-2">
+                            <label className="text-sm text-slate-400">Top K Results</label>
+                            <span className="text-sm font-mono text-primary font-bold">{topK}</span>
+                            </div>
+                            <input 
+                            type="range" 
+                            min="1" 
+                            max={MAX_K} 
+                            value={topK} 
+                            onChange={(e) => setTopK(parseInt(e.target.value))}
+                            className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-primary hover:accent-secondary"
+                            />
+                        </div>
+
+                        <button
+                            onClick={handleSearch}
+                            disabled={!selectedFile || isSearching || systemStatus?.status !== 'ready'}
+                            className="w-full py-3 px-4 bg-primary hover:bg-secondary disabled:opacity-50 disabled:cursor-not-allowed rounded-xl font-semibold text-white transition-all flex items-center justify-center gap-2 shadow-lg shadow-primary/25"
+                        >
+                            {isSearching ? (
+                            <>
+                                <Loader2 className="w-5 h-5 animate-spin" />
+                                Searching...
+                            </>
+                            ) : (
+                            <>
+                                <Search className="w-5 h-5" />
+                                Find Similar Images
+                            </>
+                            )}
+                        </button>
+                        
+                        {error && (
+                            <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-lg text-rose-400 text-sm flex items-start gap-2">
+                            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                            {error}
+                            </div>
+                        )}
+                        </div>
+                    </div>
+                    </div>
+
+                    {/* Right Column: Results */}
+                    <div className="lg:col-span-8">
+                    <div className="flex items-center justify-between mb-6">
+                        <h2 className="text-2xl font-bold">Results</h2>
+                        {results.length > 0 && (
+                        <span className="text-slate-400 text-sm">Found {results.length} matches</span>
+                        )}
+                    </div>
+
+                    {results.length === 0 ? (
+                        <div className="h-[500px] border border-slate-800 rounded-2xl flex flex-col items-center justify-center text-slate-500 bg-surface/30">
+                        <Search className="w-16 h-16 mb-4 opacity-20" />
+                        <p>Upload an image and hit search to see results</p>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-3 gap-6">
+                        {results.map((result, idx) => (
+                            <div 
+                            key={idx} 
+                            onClick={() => setZoomedImage(result)}
+                            className="group bg-surface border border-slate-700 rounded-xl overflow-hidden shadow-lg hover:shadow-primary/10 transition-all duration-300 hover:-translate-y-1 cursor-zoom-in relative"
+                            >
+                            <div className="aspect-square relative overflow-hidden bg-black">
+                                <img 
+                                src={result.url} 
+                                alt={result.filename}
+                                className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
+                                onError={(e) => {
+                                    (e.target as HTMLImageElement).src = 'https://placehold.co/400x400?text=Image+Not+Found';
+                                }}
+                                />
+                                
+                                {/* Hover Overlay with Zoom Icon */}
+                                <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-center justify-center z-10">
+                                    <ZoomIn className="text-white w-8 h-8 drop-shadow-md transform scale-75 group-hover:scale-100 transition-transform duration-300" />
+                                </div>
+
+                                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col justify-end p-4 z-20 pointer-events-none">
+                                <p className="text-white text-sm font-medium truncate">{result.filename}</p>
+                                </div>
+                            </div>
+                            <div className="p-3 border-t border-slate-700 bg-slate-800/50">
+                                <div className="flex justify-between items-center text-xs">
+                                <span className="text-slate-400">Distance (L2)</span>
+                                <span className="font-mono text-primary bg-primary/10 px-2 py-0.5 rounded">
+                                    {result.distance.toFixed(4)}
+                                </span>
+                                </div>
+                            </div>
+                            </div>
+                        ))}
+                        </div>
+                    )}
+                    </div>
                 </div>
-              )}
-            </div>
-          </div>
-        )}
+                )}
 
-        {/* VIEW: GALLERY */}
-        {activeTab === 'gallery' && (
-           <div className="animate-in fade-in duration-500">
-              <div className="flex items-center justify-between mb-6">
-                 <div>
-                    <h2 className="text-2xl font-bold">Database Gallery</h2>
-                    <p className="text-slate-400 text-sm">Browse all indexed images</p>
-                 </div>
-              </div>
-              <GalleryGrid onZoom={(img) => setZoomedImage({...img, distance: 0})} />
-           </div>
-        )}
+                {/* VIEW: GALLERY */}
+                {activeTab === 'gallery' && (
+                <div className="animate-in fade-in duration-500">
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h2 className="text-2xl font-bold">Database Gallery</h2>
+                            <p className="text-slate-400 text-sm">Browse all indexed images</p>
+                        </div>
+                    </div>
+                    <GalleryGrid versionKey={dataVersion} onZoom={(img) => setZoomedImage({...img, distance: 0})} />
+                </div>
+                )}
 
-        {/* VIEW: VISUALIZATION */}
-        {activeTab === 'visualization' && (
-           <div className="animate-in fade-in duration-500">
-              <div className="flex items-center justify-between mb-6">
-                 <div>
-                    <h2 className="text-2xl font-bold">Vector Space</h2>
-                    <p className="text-slate-400 text-sm">3D visualization of image embeddings using PCA</p>
-                 </div>
-              </div>
-              <VectorSpace />
-           </div>
+                {/* VIEW: VISUALIZATION */}
+                {activeTab === 'visualization' && (
+                <div className="animate-in fade-in duration-500">
+                    <div className="flex items-center justify-between mb-6">
+                        <div>
+                            <h2 className="text-2xl font-bold">Vector Space</h2>
+                            <p className="text-slate-400 text-sm">3D visualization of image embeddings using PCA</p>
+                        </div>
+                    </div>
+                    <VectorSpace versionKey={dataVersion} onPointClick={handlePointClick} />
+                </div>
+                )}
+            </>
         )}
 
       </main>
@@ -560,16 +895,32 @@ export default function App() {
       {/* Lightbox / Modal */}
       {zoomedImage && (
         <div 
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/95 backdrop-blur-sm p-4 animate-in fade-in duration-200"
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/95 backdrop-blur-sm p-4 animate-in fade-in duration-200"
           onClick={() => setZoomedImage(null)}
         >
-          {/* Close Button */}
-          <button 
-            onClick={() => setZoomedImage(null)}
-            className="absolute top-6 right-6 p-2 rounded-full bg-slate-800/50 hover:bg-slate-700 text-white/80 hover:text-white transition-colors z-50"
-          >
-            <X className="w-8 h-8" />
-          </button>
+          {/* Action Buttons Container */}
+          <div className="absolute top-6 right-6 flex items-center gap-3 z-50">
+             {/* Delete Button */}
+             <button
+               onClick={(e) => {
+                  e.stopPropagation();
+                  handleDeleteImage();
+               }}
+               disabled={isDeleting}
+               className="p-2 rounded-full bg-rose-500/10 hover:bg-rose-500 text-rose-400 hover:text-white transition-colors border border-rose-500/20"
+               title="Delete Image"
+             >
+               {isDeleting ? <Loader2 className="w-6 h-6 animate-spin"/> : <Trash2 className="w-6 h-6" />}
+             </button>
+
+             {/* Close Button */}
+             <button 
+                onClick={() => setZoomedImage(null)}
+                className="p-2 rounded-full bg-slate-800/50 hover:bg-slate-700 text-white/80 hover:text-white transition-colors border border-slate-700"
+             >
+               <X className="w-6 h-6" />
+             </button>
+          </div>
           
           <div 
             className="relative flex flex-col items-center max-w-full"
@@ -593,6 +944,63 @@ export default function App() {
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* New Project Modal */}
+      {isCreateModalOpen && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in zoom-in-95">
+            <div className="bg-surface border border-slate-700 w-full max-w-md rounded-2xl p-6 shadow-2xl relative">
+                <button 
+                  onClick={() => !isCreatingProject && setIsCreateModalOpen(false)} 
+                  className="absolute top-4 right-4 text-slate-400 hover:text-white"
+                  disabled={isCreatingProject}
+                >
+                  <X className="w-5 h-5"/>
+                </button>
+                <h3 className="text-xl font-bold mb-4 flex items-center gap-2"><FolderPlus className="w-5 h-5 text-primary"/> New Project</h3>
+                
+                <div className="space-y-4">
+                    <div>
+                        <label className="block text-sm text-slate-400 mb-1">Project Name</label>
+                        <input 
+                            type="text" 
+                            className="w-full bg-dark border border-slate-700 rounded-lg px-3 py-2 text-white focus:border-primary outline-none"
+                            placeholder="My Awesome Dataset"
+                            value={newProjectName}
+                            onChange={e => setNewProjectName(e.target.value)}
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-sm text-slate-400 mb-1">Select Image Folder</label>
+                        <input 
+                            type="file" 
+                            // @ts-ignore
+                            webkitdirectory=""
+                            directory=""
+                            multiple
+                            className="block w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:bg-slate-700 file:text-white hover:file:bg-slate-600 cursor-pointer"
+                            onChange={e => setNewProjectFiles(e.target.files)}
+                        />
+                        <p className="text-xs text-slate-500 mt-1">Select a folder to upload all images within it.</p>
+                        {newProjectFiles && (
+                           <p className="text-xs text-primary mt-1">{newProjectFiles.length} files found</p>
+                        )}
+                    </div>
+                    
+                    <button 
+                        onClick={handleCreateProject}
+                        disabled={!newProjectName || !newProjectFiles || isCreatingProject}
+                        className="w-full py-2.5 bg-primary hover:bg-secondary rounded-xl font-semibold text-white mt-4 disabled:opacity-50 flex items-center justify-center gap-2"
+                    >
+                        {isCreatingProject ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin"/> Uploading...
+                          </>
+                        ) : "Create & Index"}
+                    </button>
+                </div>
+            </div>
         </div>
       )}
 

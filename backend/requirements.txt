@@ -4,5 +4,4 @@ ultralytics
 faiss-cpu
 numpy
 python-multipart
-pyyaml
 Pillow

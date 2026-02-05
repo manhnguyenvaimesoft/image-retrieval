@@ -1,21 +1,22 @@
 import os
 import time
 import json
-import yaml
 import shutil
+import uuid
+import threading
 import numpy as np
 import faiss
-from typing import List, Optional
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request
+from typing import List, Optional, Dict
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from ultralytics import YOLO
 from PIL import Image
 
 # Initialize FastAPI
 app = FastAPI(title="NeuroSearch API")
 
-# CORS Setup (Allow Frontend to connect)
+# CORS Setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,148 +25,361 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load Configuration
-CONFIG_PATH = "config.yaml"
-if not os.path.exists(CONFIG_PATH):
-    # Fallback default if file missing
-    config = {
-        "dataset": {"train_path": "./train_data"},
-        "storage": {"index_file": "vector.index", "metadata_file": "image_paths.json"},
-        "model": {"name": "yolov8n-cls.pt"}
-    }
-else:
-    with open(CONFIG_PATH, "r") as f:
-        config = yaml.safe_load(f)
-        # Storage is always set to default.
-        project_base_path = config.get("project", {}).get("base_path", "./projects/default_project")
-        config["storage"] = {"index_file": f"{project_base_path}/vector.index", "metadata_file": f"{project_base_path}/image_paths.json"}
+# --- Global State & Configuration ---
+# REMOVED: CONFIG_PATH = "config.yaml"
+PROJECTS_FILE = "projects.json"
+PROJECTS_DIR = "projects_data"  # Folder to store indices for new projects
+UPLOADS_DIR = "uploads" # Folder to store user uploaded images
 
 # Global Variables
 index: Optional[faiss.IndexFlatL2] = None
 image_paths: List[str] = []
 model: Optional[YOLO] = None
+current_project: Optional[Dict] = None
 
-# Ensure Dataset Directory Exists for Serving
-TRAIN_PATH = config["dataset"]["train_path"]
-if not os.path.exists(TRAIN_PATH):
-    os.makedirs(TRAIN_PATH, exist_ok=True)
+YOLO_MODEL_PATH = "./weights/yolo26x-cls.pt"
 
-# Mount static files to serve images to frontend
-# Access images via http://localhost:8000/images/filename.png
-app.mount("/images", StaticFiles(directory=TRAIN_PATH), name="images")
+# Indexing State for Progress Bar
+indexing_state = {
+    "is_indexing": False,
+    "progress": 0,
+    "total_files": 0,
+    "processed_files": 0,
+    "current_step": "idle" # idle, loading_images, embedding, saving, complete
+}
+
+# Ensure directories exist
+if not os.path.exists(PROJECTS_DIR):
+    os.makedirs(PROJECTS_DIR, exist_ok=True)
+if not os.path.exists(UPLOADS_DIR):
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+def load_projects_list():
+    if not os.path.exists(PROJECTS_FILE):
+        return []
+    try:
+        with open(PROJECTS_FILE, "r") as f:
+            projects = json.load(f)
+            # Ensure compatibility if file exists but is empty or malformed
+            if not isinstance(projects, list):
+                return []
+            return projects
+    except Exception:
+        return []
+
+def save_projects_list(projects):
+    with open(PROJECTS_FILE, "w") as f:
+        json.dump(projects, f, indent=2)
+
+def initialize_projects():
+    """Ensures projects.json exists"""
+    if not os.path.exists(PROJECTS_FILE):
+        save_projects_list([])
+    return load_projects_list()
 
 def load_model():
     global model
-    print(f"Loading YOLO model: {config['model']['path']}...")
+    # Hardcoded default or use Environment Variable
+    model_path = os.environ.get("YOLO_MODEL_PATH", YOLO_MODEL_PATH)
+
+    print(f"Loading YOLO model: {model_path}...")
     try:
-        model = YOLO(config['model']['path'])
+        model = YOLO(model_path)
     except Exception as e:
-        print(f"Error loading model: {e}. Trying generic 'yolov8n-cls.pt'")
-        model = YOLO('./weights/yolov8n-cls.pt')
+        print(f"Error loading model from {model_path}: {e}. Trying generic 'yolov8n-cls.pt'")
+        try:
+            model = YOLO('yolov8n-cls.pt')
+        except Exception as e2:
+            print(f"CRITICAL: Failed to load any YOLO model: {e2}")
+            model = None
 
 def get_embedding(source):
-    """
-    Extract feature vector using YOLO. 
-    Source can be a file path or a PIL Image.
-    """
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
-    
-    # YOLO embed returns a list of tensors
     results = model.embed(source)
-    # Return first result as numpy array (float32 for FAISS)
     return results[0].cpu().numpy().astype('float32')
 
-def build_index():
-    global index, image_paths
-    
-    print("Building new index from scratch...")
-    if not os.path.exists(TRAIN_PATH):
-        print(f"Warning: Train path {TRAIN_PATH} does not exist.")
-        return
+# --- Background Task for Indexing ---
+def process_build_index(project_id: str, train_path: str, index_file: str, metadata_file: str):
+    global indexing_state, index, image_paths, current_project
 
-    # files = [f for f in os.listdir(TRAIN_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
-    # Instead of just browsing within a folder, use recursive browsing to retrieve all images in subfolders.
-    files = []
-    for root, _, filenames in os.walk(TRAIN_PATH):
-        for filename in filenames:
-            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
-                # Get relative path to TRAIN_PATH
-                relative_path = os.path.relpath(os.path.join(root, filename), TRAIN_PATH)
-                files.append(relative_path)
-
-    if not files:
-        print("No images found in train path.")
-        return
-
-    vectors = []
-    valid_paths = []
-    
-    total = len(files)
-    print(f"Processing {total} images...")
-
-    for idx, f in enumerate(files):
-        full_path = os.path.join(TRAIN_PATH, f)
-        try:
-            vec = get_embedding(full_path)
-            vectors.append(vec)
-            valid_paths.append(f) # Store filename relative to TRAIN_PATH
-        except Exception as e:
-            print(f"Error processing {f}: {e}")
+    try:
+        indexing_state["is_indexing"] = True
+        indexing_state["progress"] = 0
+        indexing_state["current_step"] = "Scanning directory..."
         
-        if (idx + 1) % 10 == 0:
-            print(f"Processed {idx + 1}/{total}")
+        print(f"Starting background index build for: {train_path}")
+        
+        if not os.path.exists(train_path):
+            raise Exception(f"Train path does not exist: {train_path}")
 
-    if not vectors:
-        print("Failed to extract any vectors.")
-        return
+        # 1. Scan Files
+        files = []
+        for root, _, filenames in os.walk(train_path):
+            for filename in filenames:
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
+                    relative_path = os.path.relpath(os.path.join(root, filename), train_path)
+                    files.append(relative_path)
+        
+        if not files:
+            raise Exception("No images found in the specified directory.")
 
-    dataset_vectors = np.array(vectors)
+        indexing_state["total_files"] = len(files)
+        indexing_state["current_step"] = "Extracting embeddings..."
+        
+        vectors = []
+        valid_paths = []
+        
+        # 2. Extract Embeddings
+        for idx, f in enumerate(files):
+            full_path = os.path.join(train_path, f)
+            try:
+                vec = get_embedding(full_path)
+                vectors.append(vec)
+                valid_paths.append(f)
+            except Exception as e:
+                print(f"Error embedding {f}: {e}")
+            
+            # Update progress
+            processed = idx + 1
+            indexing_state["processed_files"] = processed
+            indexing_state["progress"] = int((processed / len(files)) * 90) # Up to 90%
+        
+        if not vectors:
+            raise Exception("Failed to extract vectors from any image.")
+
+        # 3. Build FAISS
+        indexing_state["current_step"] = "Building Index..."
+        dataset_vectors = np.array(vectors)
+        dimension = dataset_vectors.shape[1]
+        new_index = faiss.IndexFlatL2(dimension)
+        new_index.add(dataset_vectors)
+        
+        # 4. Save
+        indexing_state["current_step"] = "Saving data..."
+        
+        # Ensure directory for index file exists
+        os.makedirs(os.path.dirname(index_file), exist_ok=True)
+        os.makedirs(os.path.dirname(metadata_file), exist_ok=True)
+
+        faiss.write_index(new_index, index_file)
+        with open(metadata_file, "w") as f:
+            json.dump(valid_paths, f)
+            
+        print("Index build complete.")
+
+        # Auto-load if this is the current project
+        if current_project and current_project['id'] == project_id:
+            index = new_index
+            image_paths = valid_paths
+
+    except Exception as e:
+        print(f"Indexing Failed: {e}")
+        indexing_state["current_step"] = f"Error: {str(e)}"
+    finally:
+        indexing_state["progress"] = 100
+        indexing_state["is_indexing"] = False
+
+def load_project_data(project):
+    global index, image_paths, current_project
     
-    # Create FAISS Index
-    dimension = dataset_vectors.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(dataset_vectors)
-    image_paths = valid_paths
+    print(f"Loading project: {project['name']}")
+    
+    # Verify train path
+    if not os.path.exists(project['train_path']):
+         print(f"Warning: Project path {project['train_path']} missing.")
+    
+    if os.path.exists(project['index_file']) and os.path.exists(project['metadata_file']):
+        try:
+            index = faiss.read_index(project['index_file'])
+            with open(project['metadata_file'], "r") as f:
+                image_paths = json.load(f)
+            current_project = project
+            print(f"Project loaded. {index.ntotal} vectors.")
+            return True
+        except Exception as e:
+            print(f"Error loading project data: {e}")
+            return False
+    else:
+        print("Project index missing. Needs building.")
+        current_project = project
+        index = None
+        image_paths = []
+        return False
 
-    # Save to disk
-    print("Saving index and metadata...")
-    faiss.write_index(index, config["storage"]["index_file"])
-    with open(config["storage"]["metadata_file"], "w") as f:
-        json.dump(image_paths, f)
-    print("Index built and saved successfully.")
+# --- Endpoints ---
 
 @app.on_event("startup")
 async def startup_event():
     load_model()
-    global index, image_paths
+    projects = initialize_projects()
     
-    index_file = config["storage"]["index_file"]
-    meta_file = config["storage"]["metadata_file"]
-
-    # Check if index exists
-    if os.path.exists(index_file) and os.path.exists(meta_file):
-        print("Loading existing FAISS index...")
-        index = faiss.read_index(index_file)
-        with open(meta_file, "r") as f:
-            image_paths = json.load(f)
-        print(f"Loaded {index.ntotal} vectors.")
+    # Logic: Only load if there is a project marked as default
+    default_project = next((p for p in projects if p.get("is_default") is True), None)
+    
+    if default_project:
+        print(f"Startup: Loading default project '{default_project['name']}'")
+        load_project_data(default_project)
     else:
-        print("Index not found. Triggering build process...")
-        build_index()
+        print("Startup: No default project set. Waiting for user selection.")
+
+@app.get("/projects")
+def get_projects():
+    return load_projects_list()
+
+@app.post("/projects/create")
+async def create_project(
+    name: str = Form(...), 
+    files: List[UploadFile] = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    if indexing_state["is_indexing"]:
+        raise HTTPException(status_code=400, detail="Another indexing process is running.")
+
+    projects = load_projects_list()
+    
+    # Check if this is the first project ever
+    is_first_project = len(projects) == 0
+
+    project_id = str(uuid.uuid4())[:8]
+    
+    # Create a safe directory name for the project
+    safe_name = "".join([c for c in name if c.isalnum() or c in (' ', '-', '_')]).strip().replace(' ', '_')
+    if not safe_name:
+        safe_name = project_id
+        
+    project_train_path = os.path.join(UPLOADS_DIR, safe_name)
+    
+    # Ensure project upload directory exists
+    if not os.path.exists(project_train_path):
+        os.makedirs(project_train_path, exist_ok=True)
+    
+    # Save uploaded files
+    saved_count = 0
+    ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
+    
+    try:
+        for file in files:
+            # Check extension
+            ext = os.path.splitext(file.filename)[1].lower()
+            if ext not in ALLOWED_EXTENSIONS:
+                continue
+
+            # We use just the filename to flatten structure for simplicity
+            file_path = os.path.join(project_train_path, os.path.basename(file.filename))
+            with open(file_path, "wb+") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            saved_count += 1
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded files: {e}")
+
+    if saved_count == 0:
+        try:
+            os.rmdir(project_train_path)
+        except:
+            pass
+        raise HTTPException(status_code=400, detail="No valid image files found in the selection.")
+
+    # Define storage paths inside PROJECTS_DIR (metadata/indices)
+    index_file = os.path.join(PROJECTS_DIR, project_id, "vector.index")
+    metadata_file = os.path.join(PROJECTS_DIR, project_id, "paths.json")
+
+    new_project = {
+        "id": project_id,
+        "name": name,
+        "train_path": os.path.abspath(project_train_path),
+        "index_file": index_file,
+        "metadata_file": metadata_file,
+        "created_at": time.time(),
+        "is_default": is_first_project # Set as default if it's the only one
+    }
+
+    # Save to list
+    projects.append(new_project)
+    save_projects_list(projects)
+
+    # Automatically load this project if it's the first one or if no project is currently loaded
+    global current_project
+    if is_first_project or current_project is None:
+        current_project = new_project
+        # Note: Index will be loaded/created by the background task
+        
+    # Start Indexing in Background
+    background_tasks.add_task(process_build_index, project_id, new_project["train_path"], index_file, metadata_file)
+
+    return {"status": "started", "project": new_project, "file_count": saved_count}
+
+@app.post("/projects/switch")
+def switch_project(project_id: str = Form(...)):
+    if indexing_state["is_indexing"]:
+        raise HTTPException(status_code=400, detail="Cannot switch while indexing.")
+
+    projects = load_projects_list()
+    target = next((p for p in projects if p["id"] == project_id), None)
+    
+    if not target:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    success = load_project_data(target)
+    
+    return {
+        "status": "success" if success else "needs_indexing", 
+        "project": target,
+        "message": "Switched successfully" if success else "Project switched but index missing"
+    }
+
+@app.post("/projects/set_default")
+def set_default_project(project_id: str = Form(...)):
+    projects = load_projects_list()
+    target = next((p for p in projects if p["id"] == project_id), None)
+    
+    if not target:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Update default flags
+    for p in projects:
+        p["is_default"] = (p["id"] == project_id)
+        
+    save_projects_list(projects)
+    
+    return {"status": "success", "message": f"Project '{target['name']}' set as default."}
+
+@app.get("/indexing_status")
+def get_indexing_status():
+    return indexing_state
 
 @app.get("/status")
 def get_status():
+    status = "ready"
+    if indexing_state["is_indexing"]:
+        status = "indexing"
+    elif index is None:
+        status = "loading" # or empty
+        
     return {
-        "status": "ready" if index is not None else "loading",
+        "status": status,
         "index_size": index.ntotal if index else 0,
-        "train_path": TRAIN_PATH
+        "current_project": current_project["name"] if current_project else "None",
+        "train_path": current_project["train_path"] if current_project else ""
     }
+
+# Dynamic Image Serving
+@app.get("/serve_image/{filename:path}")
+def serve_image(filename: str):
+    if not current_project:
+        raise HTTPException(status_code=503, detail="No project loaded. Please select a project.")
+    
+    file_path = os.path.join(current_project["train_path"], filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(file_path)
 
 @app.get("/database")
 def get_database(request: Request):
     """Return all images in the database"""
-    if not image_paths:
+    if not image_paths or not current_project:
         return []
     
     base_url = str(request.base_url)
@@ -173,57 +387,41 @@ def get_database(request: Request):
     for filename in image_paths:
         results.append({
             "filename": filename,
-            "url": f"{base_url}images/{filename}"
+            "url": f"{base_url}serve_image/{filename}"
         })
-    # Reverse to show newest first if strictly appended, 
-    # but build_index sorts by OS, so strictly speaking not chronological.
     return results
 
 @app.get("/visualize")
 def get_visualization(request: Request):
-    """
-    Reduce vector dimensions to 3D using PCA (SVD) for visualization.
-    Returns x, y, z coordinates for every image.
-    """
-    global index, image_paths
+    global index, image_paths, current_project
     
+    if not current_project:
+         return {"error": "No project loaded. Please select a project."}
+
     if index is None or index.ntotal < 3:
         return {"error": "Not enough data to visualize (need at least 3 images)"}
 
-    # 1. Reconstruct all vectors from FAISS
-    # IndexFlatL2 stores raw vectors, so we can reconstruct them.
-    vectors = index.reconstruct_n(0, index.ntotal) # Shape: (N, D)
+    # Reconstruct vectors
+    vectors = index.reconstruct_n(0, index.ntotal)
     
-    # 2. Perform PCA using NumPy (SVD)
-    # Center the data
+    # PCA
     mean = np.mean(vectors, axis=0)
     centered = vectors - mean
     
-    # SVD
-    # U, S, Vt = np.linalg.svd(centered, full_matrices=False)
-    # Project to top 3 components
-    # Projection = centered @ Vt.T[:, :3]
     try:
-        # Using numpy's SVD is robust. 
-        # We only need the top 3 principal components (columns of V, or rows of Vt)
         U, S, Vt = np.linalg.svd(centered, full_matrices=False)
-        components = Vt[:3] # Shape (3, D)
-        projection = np.dot(centered, components.T) # Shape (N, 3)
-        
-        # Normalize to typical plotting range (-1 to 1 or similar) for cleaner charts if needed
-        # But raw PCA scores are usually fine.
+        components = Vt[:3]
+        projection = np.dot(centered, components.T)
     except Exception as e:
-        print(f"PCA Error: {e}")
         return {"error": f"Failed to compute visualization: {e}"}
 
-    # 3. Format output
     points = []
     base_url = str(request.base_url)
     
     for i, path in enumerate(image_paths):
         points.append({
             "filename": path,
-            "url": f"{base_url}images/{path}",
+            "url": f"{base_url}serve_image/{path}",
             "x": float(projection[i, 0]),
             "y": float(projection[i, 1]),
             "z": float(projection[i, 2])
@@ -233,21 +431,14 @@ def get_visualization(request: Request):
 
 @app.post("/add")
 async def add_to_index(file: UploadFile = File(...)):
-    """
-    Upload a new image, save it to dataset, embed it, and add to FAISS index.
-    """
-    global index, image_paths
+    global index, image_paths, current_project
 
-    if index is None:
-        raise HTTPException(status_code=503, detail="Index not initialized")
+    if index is None or not current_project:
+        raise HTTPException(status_code=503, detail="Index/Project not initialized")
 
-    # 1. Save file to TRAIN_PATH
     filename = file.filename
-    # Handle duplicates by prepending timestamp if needed, but simple overwrite for now
-    if not filename:
-         raise HTTPException(status_code=400, detail="Filename missing")
-         
-    save_path = os.path.join(TRAIN_PATH, filename)
+    # Check for duplicate filenames roughly? For now just overwrite
+    save_path = os.path.join(current_project["train_path"], filename)
     
     try:
         with open(save_path, "wb") as buffer:
@@ -255,33 +446,26 @@ async def add_to_index(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
-    # 2. Extract Embedding
     try:
-        # Load the saved image to ensure it's valid and get embedding
-        # We assume get_embedding handles path string
         vec = get_embedding(save_path)
-        vec = vec.reshape(1, -1) # Reshape for FAISS (1, dim)
+        vec = vec.reshape(1, -1)
     except Exception as e:
-        # If embedding fails, remove the file to keep state consistent
-        if os.path.exists(save_path):
-            os.remove(save_path)
+        if os.path.exists(save_path): os.remove(save_path)
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
 
-    # 3. Update Index in Memory
     try:
         index.add(vec)
         image_paths.append(filename)
     except Exception as e:
          raise HTTPException(status_code=500, detail=f"Failed to update index: {e}")
 
-    # 4. Save Index and Metadata to Disk (Persistence)
+    # Persistence
     try:
-        faiss.write_index(index, config["storage"]["index_file"])
-        with open(config["storage"]["metadata_file"], "w") as f:
+        faiss.write_index(index, current_project["index_file"])
+        with open(current_project["metadata_file"], "w") as f:
             json.dump(image_paths, f)
     except Exception as e:
         print(f"Warning: Failed to save index to disk: {e}")
-        # We don't fail the request here, but data might be lost on restart
 
     return {
         "status": "success", 
@@ -290,48 +474,85 @@ async def add_to_index(file: UploadFile = File(...)):
         "message": "Image added to database successfully"
     }
 
+@app.post("/delete")
+def delete_image(filename: str = Form(...)):
+    global index, image_paths, current_project
+    
+    if not current_project:
+        raise HTTPException(status_code=503, detail="No project loaded")
+        
+    if index is None:
+        raise HTTPException(status_code=503, detail="Index not loaded")
+
+    if filename not in image_paths:
+        raise HTTPException(status_code=404, detail="Image not found in index")
+
+    try:
+        # 1. Find index
+        idx = image_paths.index(filename)
+
+        # 2. Remove from FAISS
+        # Note: removing from flat index shifts subsequent IDs
+        index.remove_ids(np.array([idx], dtype='int64'))
+
+        # 3. Remove from Metadata List
+        image_paths.pop(idx)
+
+        # 4. Remove File from Disk -> SKIPPED based on user request to keep physical file
+        # full_path = os.path.join(current_project["train_path"], filename)
+        # if os.path.exists(full_path):
+        #    os.remove(full_path)
+
+        # 5. Persist Changes
+        faiss.write_index(index, current_project["index_file"])
+        with open(current_project["metadata_file"], "w") as f:
+            json.dump(image_paths, f)
+
+        return {"status": "deleted", "index_size": index.ntotal}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+
 @app.post("/search")
 async def search_image(request: Request, k: int = Form(5), file: UploadFile = File(...)):
-    global index, image_paths
+    global index, image_paths, current_project
     
+    if not current_project:
+        raise HTTPException(status_code=503, detail="No project selected.")
+        
     if index is None or not image_paths:
-        raise HTTPException(status_code=503, detail="Index is not ready or empty.")
+        # It's possible to have a project but no index yet (indexing or empty)
+        raise HTTPException(status_code=503, detail="Index is empty or not ready.")
 
-    # Read uploaded image
     start_time = time.time()
     try:
         contents = await file.read()
-        # Save temp file or stream to PIL
-        # Using PIL directly from bytes
         import io
         image_data = Image.open(io.BytesIO(contents))
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid image file")
 
-    # Get query embedding
     try:
         query_vector = get_embedding(image_data)
         query_vector = query_vector.reshape(1, -1)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding extraction failed: {str(e)}")
 
-    # Search
-    # k might be larger than dataset
     search_k = min(k, len(image_paths))
     distances, indices = index.search(query_vector, k=search_k)
 
     results = []
-    base_url = str(request.base_url) # Get base URL from request (e.g., http://192.168.1.35:8000/)
+    base_url = str(request.base_url)
 
     for i, idx in enumerate(indices[0]):
-        if idx == -1: continue # FAISS padding
+        if idx == -1: continue
         
         filename = image_paths[idx]
         results.append({
             "filename": filename,
-            "filepath": os.path.join(TRAIN_PATH, filename),
-            # Use dynamic base_url so images load on LAN devices
-            "url": f"{base_url}images/{filename}",
+            "filepath": os.path.join(current_project["train_path"], filename),
+            # Use new serve_image endpoint
+            "url": f"{base_url}serve_image/{filename}",
             "distance": float(distances[0][i])
         })
 
@@ -342,11 +563,6 @@ async def search_image(request: Request, k: int = Form(5), file: UploadFile = Fi
         "query_time": elapsed
     }
 
-@app.get("/")
-def home():
-    return {"message": "Welcome to the NeuroSearch API"}
-
 if __name__ == "__main__":
     import uvicorn
-    # host="0.0.0.0" allows access from other devices on the network
     uvicorn.run(app, host="0.0.0.0", port=8000)
