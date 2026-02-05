@@ -5,3 +5,8 @@ faiss-cpu
 numpy
 python-multipart
 Pillow
+passlib[bcrypt]
+python-jose[cryptography]
+python-dotenv
+argon2-cffi
+sqlalchemy
