@@ -2,4 +2,4 @@ __pycache__/
 projects_data/
 uploads/
 .env
-.db
+*.db
