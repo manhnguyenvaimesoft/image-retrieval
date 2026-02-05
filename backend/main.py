@@ -36,6 +36,9 @@ if not os.path.exists(CONFIG_PATH):
 else:
     with open(CONFIG_PATH, "r") as f:
         config = yaml.safe_load(f)
+        # Storage is always set to default.
+        project_base_path = config.get("project", {}).get("base_path", "./projects/default_project")
+        config["storage"] = {"index_file": f"{project_base_path}/vector.index", "metadata_file": f"{project_base_path}/image_paths.json"}
 
 # Global Variables
 index: Optional[faiss.IndexFlatL2] = None
@@ -53,12 +56,12 @@ app.mount("/images", StaticFiles(directory=TRAIN_PATH), name="images")
 
 def load_model():
     global model
-    print(f"Loading YOLO model: {config['model']['name']}...")
+    print(f"Loading YOLO model: {config['model']['path']}...")
     try:
-        model = YOLO(config['model']['name'])
+        model = YOLO(config['model']['path'])
     except Exception as e:
         print(f"Error loading model: {e}. Trying generic 'yolov8n-cls.pt'")
-        model = YOLO('yolov8n-cls.pt')
+        model = YOLO('./weights/yolov8n-cls.pt')
 
 def get_embedding(source):
     """
@@ -81,7 +84,16 @@ def build_index():
         print(f"Warning: Train path {TRAIN_PATH} does not exist.")
         return
 
-    files = [f for f in os.listdir(TRAIN_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+    # files = [f for f in os.listdir(TRAIN_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+    # Instead of just browsing within a folder, use recursive browsing to retrieve all images in subfolders.
+    files = []
+    for root, _, filenames in os.walk(TRAIN_PATH):
+        for filename in filenames:
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                # Get relative path to TRAIN_PATH
+                relative_path = os.path.relpath(os.path.join(root, filename), TRAIN_PATH)
+                files.append(relative_path)
+
     if not files:
         print("No images found in train path.")
         return
@@ -329,6 +341,10 @@ async def search_image(request: Request, k: int = Form(5), file: UploadFile = Fi
         "results": results,
         "query_time": elapsed
     }
+
+@app.get("/")
+def home():
+    return {"message": "Welcome to the NeuroSearch API"}
 
 if __name__ == "__main__":
     import uvicorn
