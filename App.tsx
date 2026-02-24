@@ -12,6 +12,8 @@ type Tab = 'search' | 'gallery' | 'visualization';
 // Extend Project type locally to include new field if backend sends it
 interface ExtendedProject extends Project {
     is_default?: boolean;
+    is_indexing?: boolean;
+    indexing_progress?: number;
 }
 
 // Helper for Fetch with Auth Header
@@ -436,6 +438,9 @@ export default function App() {
     fetchProjects();
     const interval = setInterval(async () => {
        try {
+         // Poll projects list to update spinners/locks for background tasks
+         fetchProjects();
+
          // Check System Status
          const resStatus = await authFetch(`${API_BASE_URL}/status`);
          if(resStatus.ok) {
@@ -474,6 +479,35 @@ export default function App() {
             setProjects(data);
         }
     } catch (e) { console.error("Failed to load projects"); }
+  };
+
+  const handleDeleteProject = async (projectId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const project = projects.find(p => p.id === projectId);
+    if (!window.confirm(`Are you sure you want to PERMANENTLY delete project "${project?.name}"? This action cannot be undone.`)) return;
+
+    try {
+        const formData = new FormData();
+        formData.append('project_id', projectId);
+        const res = await authFetch(`${API_BASE_URL}/projects/delete`, { method: 'POST', body: formData });
+        
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || "Failed to delete project");
+        }
+
+        // If the deleted project was the active one, clear local state
+        if (systemStatus?.current_project === project?.name) {
+            setSystemStatus(prev => prev ? ({...prev, current_project: "None", status: "loading"}) : null);
+            setResults([]);
+            setSelectedFile(null);
+            setDataVersion(0);
+        }
+
+        fetchProjects();
+    } catch (err: any) {
+        alert(err.message);
+    }
   };
 
   const handleCreateProject = async () => {
@@ -718,13 +752,21 @@ export default function App() {
                                             "w-full px-4 py-2 text-sm flex items-center justify-between group cursor-pointer transition-colors border-l-2",
                                             systemStatus?.current_project === p.name 
                                                 ? "bg-primary/5 border-primary text-white" 
-                                                : "border-transparent text-slate-300 hover:bg-slate-700/50"
+                                                : "border-transparent text-slate-300 hover:bg-slate-700/50",
+                                            p.is_indexing && "cursor-not-allowed opacity-70 pointer-events-none" // Lock if indexing
                                         )}
-                                        onClick={() => handleSwitchProject(p.id)}
+                                        onClick={() => !p.is_indexing && handleSwitchProject(p.id)}
                                     >
-                                        <div className="flex items-center gap-2 overflow-hidden">
+                                        <div className="flex items-center gap-2 overflow-hidden flex-1">
                                             {p.is_default && <Star className="w-3 h-3 text-amber-400 fill-amber-400" />}
                                             <span className="truncate">{p.name}</span>
+                                            {/* Show Spinner and Progress if indexing */}
+                                            {p.is_indexing && (
+                                                <span className="flex items-center gap-1 text-xs text-primary ml-2 animate-pulse">
+                                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                                    {p.indexing_progress}%
+                                                </span>
+                                            )}
                                         </div>
                                         
                                         <div className="flex items-center gap-2">
@@ -738,6 +780,13 @@ export default function App() {
                                                 )}
                                             >
                                                 <Star className={cn("w-3 h-3", p.is_default ? "text-amber-400 fill-amber-400" : "text-slate-500")} />
+                                            </button>
+                                            <button 
+                                                title="Delete Project"
+                                                onClick={(e) => handleDeleteProject(p.id, e)}
+                                                className="p-1 rounded hover:bg-rose-500/20 text-slate-500 hover:text-rose-500 transition-colors opacity-0 group-hover:opacity-100"
+                                            >
+                                                <Trash2 className="w-3 h-3" />
                                             </button>
                                         </div>
                                     </div>

@@ -333,6 +333,13 @@ def get_projects(current_user: UserModel = Depends(get_current_user), db: Sessio
     # Convert DB objects to list of dicts/schemas
     projects = []
     for p in current_user.projects:
+        # Check if this project is currently indexing
+        is_indexing = False
+        progress = 0
+        if p.id in indexing_states and indexing_states[p.id]["is_indexing"]:
+            is_indexing = True
+            progress = indexing_states[p.id]["progress"]
+
         projects.append({
             "id": p.id,
             "name": p.name,
@@ -341,7 +348,9 @@ def get_projects(current_user: UserModel = Depends(get_current_user), db: Sessio
             "metadata_file": p.metadata_file,
             "created_at": p.created_at,
             "is_default": p.is_default,
-            "owner": current_user.username
+            "owner": current_user.username,
+            "is_indexing": is_indexing,
+            "indexing_progress": progress
         })
     return projects
 
@@ -354,78 +363,86 @@ async def create_project(
     db: Session = Depends(get_db)
 ):
     username = current_user.username
-    
-    # Check if first project
-    is_first = len(current_user.projects) == 0
-
     project_id = str(uuid.uuid4())[:8]
     safe_name = "".join([c for c in name if c.isalnum() or c in (' ', '-', '_')]).strip().replace(' ', '_')
     if not safe_name: safe_name = project_id
-        
+    
     project_train_path = os.path.join(UPLOADS_DIR, f"{username}_{safe_name}_{project_id}")
-    os.makedirs(project_train_path, exist_ok=True)
-    
-    saved_count = 0
-    ALLOWED = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
-    
-    for file in files:
-        ext = os.path.splitext(file.filename)[1].lower()
-        if ext in ALLOWED:
-            file_path = os.path.join(project_train_path, os.path.basename(file.filename))
-            with open(file_path, "wb+") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            saved_count += 1
-            
-    if saved_count == 0:
-        shutil.rmtree(project_train_path)
-        raise HTTPException(status_code=400, detail="No valid images")
-
     index_file = os.path.join(PROJECTS_DIR, project_id, "vector.index")
     metadata_file = os.path.join(PROJECTS_DIR, project_id, "paths.json")
 
-    # Save to Database
-    new_project = ProjectModel(
-        id=project_id,
-        name=name,
-        train_path=os.path.abspath(project_train_path),
-        index_file=index_file,
-        metadata_file=metadata_file,
-        created_at=time.time(),
-        is_default=is_first,
-        owner_id=current_user.id
-    )
-    db.add(new_project)
-    db.commit()
-    db.refresh(new_project)
+    # Start ACID Transaction Block
+    try:
+        # 1. Create Directory
+        os.makedirs(project_train_path, exist_ok=True)
+        
+        # 2. Save Files
+        saved_count = 0
+        ALLOWED = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
+        
+        for file in files:
+            ext = os.path.splitext(file.filename)[1].lower()
+            if ext in ALLOWED:
+                file_path = os.path.join(project_train_path, os.path.basename(file.filename))
+                with open(file_path, "wb+") as buffer:
+                    shutil.copyfileobj(file.file, buffer)
+                saved_count += 1
+                
+        if saved_count == 0:
+            raise Exception("No valid images uploaded")
 
-    # Auto switch if it's the first project (In Memory)
-    if is_first:
-        session = user_sessions[username]
-        session.current_project = {
+        # 3. Create DB Entry
+        is_first = len(current_user.projects) == 0
+        new_project = ProjectModel(
+            id=project_id,
+            name=name,
+            train_path=os.path.abspath(project_train_path),
+            index_file=index_file,
+            metadata_file=metadata_file,
+            created_at=time.time(),
+            is_default=is_first,
+            owner_id=current_user.id
+        )
+        db.add(new_project)
+        db.commit() # Commit transaction
+        db.refresh(new_project)
+
+        # 4. Auto switch if it's the first project (In Memory)
+        if is_first:
+            session = user_sessions[username]
+            session.current_project = {
+                "id": new_project.id,
+                "name": new_project.name,
+                "train_path": new_project.train_path,
+                "index_file": new_project.index_file,
+                "metadata_file": new_project.metadata_file
+            }
+            session.index = None
+            session.image_paths = []
+
+        # 5. Start Indexing
+        background_tasks.add_task(process_build_index, project_id, new_project.train_path, index_file, metadata_file, username)
+
+        project_dict = {
             "id": new_project.id,
             "name": new_project.name,
             "train_path": new_project.train_path,
             "index_file": new_project.index_file,
-            "metadata_file": new_project.metadata_file
+            "metadata_file": new_project.metadata_file,
+            "created_at": new_project.created_at,
+            "is_default": new_project.is_default,
+            "owner": username
         }
-        session.index = None
-        session.image_paths = []
 
-    background_tasks.add_task(process_build_index, project_id, new_project.train_path, index_file, metadata_file, username)
+        return {"status": "started", "project": project_dict, "file_count": saved_count}
 
-    # Convert to dict for response
-    project_dict = {
-        "id": new_project.id,
-        "name": new_project.name,
-        "train_path": new_project.train_path,
-        "index_file": new_project.index_file,
-        "metadata_file": new_project.metadata_file,
-        "created_at": new_project.created_at,
-        "is_default": new_project.is_default,
-        "owner": username
-    }
-
-    return {"status": "started", "project": project_dict, "file_count": saved_count}
+    except Exception as e:
+        # Rollback everything on failure
+        db.rollback()
+        if os.path.exists(project_train_path):
+            shutil.rmtree(project_train_path)
+        print(f"Project creation failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to create project: {str(e)}")
 
 @app.post("/projects/switch")
 def switch_project(
@@ -480,6 +497,55 @@ def set_default_project(
     db.commit()
     
     return {"status": "success", "message": f"Project '{target.name}' set as default."}
+
+@app.post("/projects/delete")
+def delete_project(
+    project_id: str = Form(...),
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    username = current_user.username
+    
+    # 1. Check ownership
+    target = db.query(ProjectModel).filter(
+        ProjectModel.id == project_id,
+        ProjectModel.owner_id == current_user.id
+    ).first()
+    
+    if not target:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # 2. Prevent deleting if currently indexing
+    if project_id in indexing_states and indexing_states[project_id]["is_indexing"]:
+         raise HTTPException(status_code=400, detail="Cannot delete project while indexing")
+
+    try:
+        # 3. Remove physical files (Uploads)
+        if os.path.exists(target.train_path):
+            shutil.rmtree(target.train_path)
+            
+        # 4. Remove Index/Metadata files
+        project_data_dir = os.path.join(PROJECTS_DIR, project_id)
+        if os.path.exists(project_data_dir):
+            shutil.rmtree(project_data_dir)
+            
+        # 5. Remove from Database
+        db.delete(target)
+        db.commit()
+        
+        # 6. Clear from Session Memory if active
+        if username in user_sessions:
+            session = user_sessions[username]
+            if session.current_project and session.current_project['id'] == project_id:
+                session.current_project = None
+                session.index = None
+                session.image_paths = []
+                
+        return {"status": "success", "message": "Project deleted successfully"}
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete project: {str(e)}")
 
 @app.get("/indexing_status")
 def get_indexing_status(current_user: UserModel = Depends(get_current_user)):
@@ -632,6 +698,15 @@ def delete_image(filename: str = Form(...), current_user: UserModel = Depends(ge
         raise HTTPException(status_code=404, detail="Image not found")
 
     idx = session.image_paths.index(filename)
+    
+    # Remove file from disk (uploads folder)
+    full_path = os.path.join(session.current_project["train_path"], filename)
+    if os.path.exists(full_path):
+        try:
+            os.remove(full_path)
+        except Exception as e:
+            print(f"Warning: Could not delete file {full_path}: {e}")
+
     session.index.remove_ids(np.array([idx], dtype='int64'))
     session.image_paths.pop(idx)
 
