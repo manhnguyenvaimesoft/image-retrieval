@@ -6,24 +6,98 @@ This API provides endpoints for managing image datasets, indexing them using YOL
 
 ---
 
-## 1. Project Management
+## 1. Authentication
+
+### Register
+Register a new user.
+
+- **URL**: `/auth/register`
+- **Method**: `POST`
+- **Content-Type**: `application/x-www-form-urlencoded`
+- **Parameters**:
+  - `username` (Form String): The username.
+  - `password` (Form String): The password.
+- **Response**:
+```json
+{
+  "status": "success",
+  "message": "User created"
+}
+```
+
+### Login
+Login to get an access token.
+
+- **URL**: `/auth/login`
+- **Method**: `POST`
+- **Content-Type**: `application/x-www-form-urlencoded`
+- **Parameters**:
+  - `username` (Form String): The username.
+  - `password` (Form String): The password.
+- **Response**:
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer",
+  "username": "johndoe"
+}
+```
+
+### Change Password
+Change the current user's password.
+
+- **URL**: `/auth/change-password`
+- **Method**: `POST`
+- **Content-Type**: `application/x-www-form-urlencoded`
+- **Headers**: `Authorization: Bearer <token>`
+- **Parameters**:
+  - `old_password` (Form String): The current password.
+  - `new_password` (Form String): The new password.
+- **Response**:
+```json
+{
+  "status": "success",
+  "message": "Password updated successfully"
+}
+```
+
+### Get Current User
+Get information about the currently logged-in user.
+
+- **URL**: `/users/me`
+- **Method**: `GET`
+- **Headers**: `Authorization: Bearer <token>`
+- **Response**:
+```json
+{
+  "username": "johndoe"
+}
+```
+
+---
+
+## 2. Project Management
 
 ### Get All Projects
-Retrieves a list of all available projects.
+Retrieves a list of all available projects for the current user.
 
 - **URL**: `/projects`
 - **Method**: `GET`
+- **Headers**: `Authorization: Bearer <token>`
 - **Response**: Array of project objects.
 ```json
 [
   {
     "id": "a1b2c3d4",
     "name": "My Dataset",
-    "train_path": "/absolute/path/to/uploads/My_Dataset",
+    "train_path": "/absolute/path/to/uploads/user_My_Dataset_a1b2c3d4",
     "index_file": "projects_data/a1b2c3d4/vector.index",
     "metadata_file": "projects_data/a1b2c3d4/paths.json",
     "created_at": 1709823456.789,
-    "is_default": true
+    "is_default": true,
+    "owner": "johndoe",
+    "is_indexing": false,
+    "indexing_progress": 0
   }
 ]
 ```
