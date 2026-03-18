@@ -16,6 +16,9 @@ interface ExtendedProject extends Project {
     indexing_progress?: number;
 }
 
+// Auto format HTTP -> WS URL
+const WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws');
+
 // Helper for Fetch with Auth Header
 const authFetch = async (url: string, options: RequestInit = {}) => {
     const token = localStorage.getItem('access_token');
@@ -92,7 +95,7 @@ const AuthPage = ({ onLogin }: { onLogin: () => void }) => {
                         <Search className="w-8 h-8 text-primary" />
                     </div>
                 </div>
-                <h1 className="text-2xl font-bold text-center text-white mb-2">NeuroSearch</h1>
+                <h1 className="text-2xl font-bold text-center text-white mb-2">AimeCADCAM</h1>
                 <p className="text-slate-400 text-center text-sm mb-8">
                     {isLogin ? "Sign in to access your projects" : "Create an account to get started"}
                 </p>
@@ -431,45 +434,86 @@ export default function App() {
       }
   };
 
-  // --- Poll for System Status (Only when authenticated) ---
+  // --- Server Connection (WebSockets & Initial Data) ---
   useEffect(() => {
     if (!isAuthenticated) return;
 
+    const token = localStorage.getItem("access_token");
+    if (!token) return;
+
+    // Fetch initial state once
     fetchProjects();
-    const interval = setInterval(async () => {
-       try {
-         // Poll projects list to update spinners/locks for background tasks
-         fetchProjects();
-
-         // Check System Status
-         const resStatus = await authFetch(`${API_BASE_URL}/status`);
-         if(resStatus.ok) {
-             const statusData = await resStatus.json();
-             setSystemStatus(statusData);
-
-             // Check Indexing Process
-             if (statusData.status === 'indexing') {
-                const resIndex = await authFetch(`${API_BASE_URL}/indexing_status`);
-                const indexData = await resIndex.json();
-                setIndexingStatus(indexData);
-             } else {
-                // If we were indexing and now we are not, refresh data
-                if (indexingStatus?.is_indexing) {
-                    setIndexingStatus(null);
-                    fetchProjects();
-                    setDataVersion(v => v + 1); // Refresh gallery
+    const initStatus = async () => {
+        try {
+            const resStatus = await authFetch(`${API_BASE_URL}/status`);
+            if (resStatus.ok) {
+                const statusData = await resStatus.json();
+                setSystemStatus(statusData);
+                
+                // If it was already indexing when we loaded the page, fetch the current progress
+                if (statusData.status === 'indexing') {
+                    const resIndex = await authFetch(`${API_BASE_URL}/indexing_status`);
+                    if (resIndex.ok) setIndexingStatus(await resIndex.json());
                 }
-             }
-         }
-       } catch (e: any) {
-         if (e.message === "Unauthorized") {
-             handleLogout(); // Force clean logout on auth fail
-         }
-         console.error("Polling error", e);
-       }
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [indexingStatus?.is_indexing, isAuthenticated]);
+            }
+        } catch (e: any) {
+            if (e.message === "Unauthorized") handleLogout();
+            console.error("Initial status fetch error", e);
+        }
+    };
+    initStatus();
+
+    // Establish WebSocket Connection
+    const ws = new WebSocket(`${WS_BASE_URL}/ws?token=${token}`);
+
+    ws.onopen = () => {
+        console.log("WebSocket connected successfully");
+    };
+
+    ws.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        
+        if (message.type === 'indexing_update') {
+            // Update the global indexing modal
+            setIndexingStatus(message.data);
+            setSystemStatus(prev => prev ? {...prev, status: 'indexing'} : null);
+            
+            // Update the specific project's progress in the dropdown menu
+            setProjects(prev => prev.map(p => 
+                p.id === message.project_id 
+                  ? { ...p, is_indexing: true, indexing_progress: message.data.progress } 
+                  : p
+            ));
+
+        } else if (message.type === 'indexing_complete') {
+            // Indexing finished! Clean up state and refresh data
+            setIndexingStatus(null);
+            fetchProjects();
+            
+            // Re-fetch server status to make sure it's 'ready'
+            authFetch(`${API_BASE_URL}/status`)
+                .then(r => r.ok && r.json())
+                .then(data => setSystemStatus(data))
+                .catch(console.error);
+                
+            // Trigger a re-render for Gallery and 3D Vector Space
+            setDataVersion(v => v + 1);
+        }
+    };
+
+    ws.onerror = (error) => {
+        console.error("WebSocket encountered an error:", error);
+    };
+
+    ws.onclose = () => {
+        console.log("WebSocket disconnected");
+    };
+
+    // Cleanup when component unmounts or user logs out
+    return () => {
+        ws.close();
+    };
+  }, [isAuthenticated]);
 
   const fetchProjects = async () => {
     try {
@@ -549,6 +593,12 @@ export default function App() {
         setSelectedFile(null);
         setPreviewUrl(null);
         setDataVersion(v => v + 1);
+        
+        // Re-fetch status to update the current_project name in the header
+        const resStatus = await authFetch(`${API_BASE_URL}/status`);
+        if (resStatus.ok) {
+             setSystemStatus(await resStatus.json());
+        }
     } catch (e) { console.error(e); }
   };
 
@@ -712,7 +762,7 @@ export default function App() {
                 <Search className="w-6 h-6 text-primary" />
                 </div>
                 <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-primary to-purple-400 hidden sm:block">
-                NeuroSearch
+                AimeCADCAM
                 </h1>
             </div>
 

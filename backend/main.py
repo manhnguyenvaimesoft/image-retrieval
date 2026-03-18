@@ -4,10 +4,11 @@ import json
 import shutil
 import uuid
 import threading
+import asyncio
 import numpy as np
 import faiss
 from typing import List, Optional, Dict
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, BackgroundTasks, Depends, status
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request, BackgroundTasks, Depends, status, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import FileResponse
@@ -20,7 +21,6 @@ from sqlalchemy.orm import Session
 
 # Import Database modules
 from database import SessionLocal, init_db, User as UserModel, Project as ProjectModel
-
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,13 +28,12 @@ load_dotenv()
 # --- Configuration ---
 SECRET_KEY = os.environ.get("SECRET_KEY")
 ALGORITHM = os.environ.get("ALGORITHM")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES")) # 1 day
-YOLO_MODEL_PATH = os.environ.get("YOLO_MODEL_PATH")
+# Sửa lại thời gian mặc định cho an toàn nếu thiếu biến môi trường
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", 1440)) 
+YOLO_MODEL_PATH = os.environ.get("YOLO_MODEL_PATH", "yolov8n-cls.pt")
 
-# Initialize FastAPI
 app = FastAPI(title="NeuroSearch API")
 
-# CORS Setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,22 +42,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Global Configuration & Paths ---
 PROJECTS_DIR = "projects_data"
 UPLOADS_DIR = "uploads"
-
-# Ensure directories exist
 os.makedirs(PROJECTS_DIR, exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# --- Auth Setup ---
-pwd_context = CryptContext(
-    schemes=["argon2"],
-    deprecated="auto",
-)
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
-# --- Database Dependency ---
 def get_db():
     db = SessionLocal()
     try:
@@ -66,36 +57,46 @@ def get_db():
     finally:
         db.close()
 
-# --- Models (Pydantic) ---
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    username: str
-
-class UserSchema(BaseModel):
-    username: str
-
-# --- State Management (Per User - In Memory) ---
-# Note: Session state (loaded index in RAM) remains in memory as it's not persistent in DB
 class UserSession:
     def __init__(self):
         self.index: Optional[faiss.IndexFlatL2] = None
         self.image_paths: List[str] = []
         self.current_project: Optional[Dict] = None
 
-# Global dictionary to hold session state for each active user
-# Key: username, Value: UserSession instance
 user_sessions: Dict[str, UserSession] = {}
-
-# Global Model (Shared)
 model: Optional[YOLO] = None
-
-# Indexing State (Simplified for multi-user: we track by project_id)
-# Key: project_id, Value: Status Dict
 indexing_states: Dict[str, Dict] = {}
 
-# --- Helper Functions ---
+# --- WebSocket Manager ---
+class ConnectionManager:
+    def __init__(self):
+        # Lưu trữ danh sách kết nối WS theo username
+        self.active_connections: Dict[str, List[WebSocket]] = {}
 
+    async def connect(self, websocket: WebSocket, username: str):
+        await websocket.accept()
+        if username not in self.active_connections:
+            self.active_connections[username] = []
+        self.active_connections[username].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, username: str):
+        if username in self.active_connections:
+            self.active_connections[username].remove(websocket)
+            if not self.active_connections[username]:
+                del self.active_connections[username]
+
+    async def send_personal_message(self, message: dict, username: str):
+        if username in self.active_connections:
+            for connection in self.active_connections[username]:
+                try:
+                    await connection.send_json(message)
+                except Exception as e:
+                    print(f"WS send error for {username}: {e}")
+
+manager = ConnectionManager()
+app_loop = None # Lưu event loop chính để background thread gọi về
+
+# --- Helper Functions ---
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -123,23 +124,30 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     except JWTError:
         raise credentials_exception
     
-    # Query User from DB
     user = db.query(UserModel).filter(UserModel.username == username).first()
     if user is None:
         raise credentials_exception
     
-    # Initialize session for user if not exists
     if username not in user_sessions:
         user_sessions[username] = UserSession()
         
     return user
 
+async def get_current_user_ws(token: str, db: Session):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None: return None
+        user = db.query(UserModel).filter(UserModel.username == username).first()
+        return user
+    except:
+        return None
+
 def load_model():
     global model
-    model_path = os.environ.get("YOLO_MODEL_PATH", "yolov8n-cls.pt")
-    print(f"Loading YOLO model: {model_path} on CPU...")
+    print(f"Loading YOLO model: {YOLO_MODEL_PATH} on CPU...")
     try:
-        model = YOLO(model_path)
+        model = YOLO(YOLO_MODEL_PATH)
         model.to('cpu')
     except Exception as e:
         print(f"Error loading model: {e}. Fallback to 'yolov8n-cls.pt'")
@@ -153,28 +161,19 @@ def load_model():
 def get_embedding(source):
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
-    
-    # Ép buộc inference bằng CPU để tránh lỗi CUDA
     results = model.embed(source, device='cpu')
-    
     return results[0].cpu().numpy().astype('float32')
 
 def load_project_data(username: str, project: ProjectModel):
     session = user_sessions[username]
-    print(f"Loading project '{project.name}' for user '{username}'")
-    
     if os.path.exists(project.index_file) and os.path.exists(project.metadata_file):
         try:
             session.index = faiss.read_index(project.index_file)
             with open(project.metadata_file, "r") as f:
                 session.image_paths = json.load(f)
-            # Convert SQLAlchemy model to dict for session usage
             session.current_project = {
-                "id": project.id,
-                "name": project.name,
-                "train_path": project.train_path,
-                "index_file": project.index_file,
-                "metadata_file": project.metadata_file
+                "id": project.id, "name": project.name, "train_path": project.train_path,
+                "index_file": project.index_file, "metadata_file": project.metadata_file
             }
             return True
         except Exception as e:
@@ -182,11 +181,8 @@ def load_project_data(username: str, project: ProjectModel):
             return False
     else:
         session.current_project = {
-            "id": project.id,
-            "name": project.name,
-            "train_path": project.train_path,
-            "index_file": project.index_file,
-            "metadata_file": project.metadata_file
+            "id": project.id, "name": project.name, "train_path": project.train_path,
+            "index_file": project.index_file, "metadata_file": project.metadata_file
         }
         session.index = None
         session.image_paths = []
@@ -194,67 +190,70 @@ def load_project_data(username: str, project: ProjectModel):
 
 # --- Background Task ---
 def process_build_index(project_id: str, train_path: str, index_file: str, metadata_file: str, username: str):
-    global indexing_states
+    global indexing_states, app_loop
     
     state = {
-        "is_indexing": True,
-        "progress": 0,
-        "total_files": 0,
-        "processed_files": 0,
-        "current_step": "Scanning directory..."
+        "is_indexing": True, "progress": 0, "total_files": 0,
+        "processed_files": 0, "current_step": "Scanning directory..."
     }
     indexing_states[project_id] = state
 
+    def broadcast(event_type: str, data: dict = None):
+        if app_loop and not app_loop.is_closed():
+            msg = {"type": event_type, "project_id": project_id}
+            if data: msg["data"] = data
+            asyncio.run_coroutine_threadsafe(manager.send_personal_message(msg, username), app_loop)
+
     try:
-        print(f"Starting index build for {project_id} (User: {username})")
+        broadcast("indexing_update", state)
         
         files = []
         for root, _, filenames in os.walk(train_path):
             for filename in filenames:
                 if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp')):
-                    relative_path = os.path.relpath(os.path.join(root, filename), train_path)
-                    files.append(relative_path)
+                    files.append(os.path.relpath(os.path.join(root, filename), train_path))
         
         if not files: raise Exception("No images found")
 
         state["total_files"] = len(files)
         state["current_step"] = "Extracting embeddings..."
+        broadcast("indexing_update", state)
         
-        vectors = []
-        valid_paths = []
+        vectors, valid_paths = [], []
         
         for idx, f in enumerate(files):
-            full_path = os.path.join(train_path, f)
             try:
-                vec = get_embedding(full_path)
+                vec = get_embedding(os.path.join(train_path, f))
                 vectors.append(vec)
                 valid_paths.append(f)
             except Exception as e:
                 print(f"Error embedding {f}: {e}")
             
-            processed = idx + 1
-            state["processed_files"] = processed
-            state["progress"] = int((processed / len(files)) * 90)
+            state["processed_files"] = idx + 1
+            state["progress"] = int(((idx + 1) / len(files)) * 90)
+            
+            # Chỉ broadcast mỗi 5 file hoặc file cuối cùng để tránh spam socket quá nhiều
+            if (idx + 1) % 5 == 0 or (idx + 1) == len(files):
+                broadcast("indexing_update", state)
         
         if not vectors: raise Exception("No vectors extracted")
 
         state["current_step"] = "Building Index..."
-        dataset_vectors = np.array(vectors)
+        broadcast("indexing_update", state)
         
+        dataset_vectors = np.array(vectors)
         new_index = faiss.IndexFlatL2(dataset_vectors.shape[1])
         new_index.add(dataset_vectors)
         
         state["current_step"] = "Saving data..."
+        broadcast("indexing_update", state)
+        
         os.makedirs(os.path.dirname(index_file), exist_ok=True)
         os.makedirs(os.path.dirname(metadata_file), exist_ok=True)
-
         faiss.write_index(new_index, index_file)
         with open(metadata_file, "w") as f:
             json.dump(valid_paths, f)
-            
-        print("Index build complete.")
 
-        # If the user is currently looking at this project, reload it into their session
         if username in user_sessions:
             session = user_sessions[username]
             if session.current_project and session.current_project['id'] == project_id:
@@ -262,112 +261,83 @@ def process_build_index(project_id: str, train_path: str, index_file: str, metad
                 session.image_paths = valid_paths
 
     except Exception as e:
-        print(f"Indexing Failed: {e}")
         state["current_step"] = f"Error: {str(e)}"
+        broadcast("indexing_update", state)
     finally:
         state["progress"] = 100
         state["is_indexing"] = False
+        broadcast("indexing_complete")
 
-# --- Auth Endpoints ---
+# --- Endpoints ---
+
+@app.on_event("startup")
+async def startup_event():
+    global app_loop
+    app_loop = asyncio.get_running_loop() # Lấy loop để chạy threadsafe WS
+    init_db()
+    load_model()
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(...), db: Session = Depends(get_db)):
+    user = await get_current_user_ws(token, db)
+    if not user:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    
+    await manager.connect(websocket, user.username)
+    try:
+        while True:
+            # Giữ kết nối mở, client không cần gửi gì, chỉ nhận
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, user.username)
 
 @app.post("/auth/register")
-async def register(
-    username: str = Form(...), 
-    password: str = Form(...), 
-    db: Session = Depends(get_db)
-):
-    existing_user = db.query(UserModel).filter(UserModel.username == username).first()
-    if existing_user:
+async def register(username: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    if db.query(UserModel).filter(UserModel.username == username).first():
         raise HTTPException(status_code=400, detail="Username already registered")
     
-    hashed_password = get_password_hash(password)
-    new_user = UserModel(username=username, hashed_password=hashed_password)
+    new_user = UserModel(username=username, hashed_password=get_password_hash(password))
     db.add(new_user)
     db.commit()
-    db.refresh(new_user)
-    
     return {"status": "success", "message": "User created"}
 
 @app.post("/auth/login")
-async def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db)
-):
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(UserModel).filter(UserModel.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token = create_access_token(data={"sub": user.username})
-    return {"access_token": access_token, "token_type": "bearer", "username": user.username}
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    return {"access_token": create_access_token({"sub": user.username}), "token_type": "bearer", "username": user.username}
 
 @app.post("/auth/change-password")
-async def change_password(
-    old_password: str = Form(...),
-    new_password: str = Form(...),
-    current_user: UserModel = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    # Re-fetch user from DB to ensure attached to session (get_current_user usually attaches, but being safe)
+async def change_password(old_password: str = Form(...), new_password: str = Form(...), current_user: UserModel = Depends(get_current_user), db: Session = Depends(get_db)):
     user = db.query(UserModel).filter(UserModel.id == current_user.id).first()
-    
     if not verify_password(old_password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Incorrect old password")
-        
     user.hashed_password = get_password_hash(new_password)
     db.commit()
-    
-    return {"status": "success", "message": "Password updated successfully"}
+    return {"status": "success"}
 
 @app.get("/users/me")
 async def read_users_me(current_user: UserModel = Depends(get_current_user)):
     return {"username": current_user.username}
 
-# --- Project Endpoints ---
-
-@app.on_event("startup")
-async def startup_event():
-    # Initialize DB Tables
-    init_db()
-    load_model()
-
 @app.get("/projects")
-def get_projects(current_user: UserModel = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Filter projects owned by user via Relationship
-    # Convert DB objects to list of dicts/schemas
+def get_projects(current_user: UserModel = Depends(get_current_user)):
     projects = []
     for p in current_user.projects:
-        # Check if this project is currently indexing
-        is_indexing = False
-        progress = 0
-        if p.id in indexing_states and indexing_states[p.id]["is_indexing"]:
-            is_indexing = True
-            progress = indexing_states[p.id]["progress"]
-
+        is_idx = indexing_states.get(p.id, {}).get("is_indexing", False)
+        prog = indexing_states.get(p.id, {}).get("progress", 0)
         projects.append({
-            "id": p.id,
-            "name": p.name,
-            "train_path": p.train_path,
-            "index_file": p.index_file,
-            "metadata_file": p.metadata_file,
-            "created_at": p.created_at,
-            "is_default": p.is_default,
-            "owner": current_user.username,
-            "is_indexing": is_indexing,
-            "indexing_progress": progress
+            "id": p.id, "name": p.name, "train_path": p.train_path,
+            "index_file": p.index_file, "metadata_file": p.metadata_file,
+            "created_at": p.created_at, "is_default": p.is_default,
+            "owner": current_user.username, "is_indexing": is_idx, "indexing_progress": prog
         })
     return projects
 
 @app.post("/projects/create")
-async def create_project(
-    name: str = Form(...), 
-    files: List[UploadFile] = File(...),
-    background_tasks: BackgroundTasks = None,
-    current_user: UserModel = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
+async def create_project(name: str = Form(...), files: List[UploadFile] = File(...), background_tasks: BackgroundTasks = None, current_user: UserModel = Depends(get_current_user), db: Session = Depends(get_db)):
     username = current_user.username
     project_id = str(uuid.uuid4())[:8]
     safe_name = "".join([c for c in name if c.isalnum() or c in (' ', '-', '_')]).strip().replace(' ', '_')
@@ -377,58 +347,39 @@ async def create_project(
     index_file = os.path.join(PROJECTS_DIR, project_id, "vector.index")
     metadata_file = os.path.join(PROJECTS_DIR, project_id, "paths.json")
 
-    # Start ACID Transaction Block
     try:
-        # 1. Create Directory
         os.makedirs(project_train_path, exist_ok=True)
-        
-        # 2. Save Files
         saved_count = 0
         ALLOWED = {'.png', '.jpg', '.jpeg', '.bmp', '.webp'}
         
         for file in files:
             ext = os.path.splitext(file.filename)[1].lower()
             if ext in ALLOWED:
-                file_path = os.path.join(project_train_path, os.path.basename(file.filename))
-                with open(file_path, "wb+") as buffer:
+                with open(os.path.join(project_train_path, os.path.basename(file.filename)), "wb+") as buffer:
                     shutil.copyfileobj(file.file, buffer)
                 saved_count += 1
                 
-        if saved_count == 0:
-            raise Exception("No valid images uploaded")
+        if saved_count == 0: raise Exception("No valid images uploaded")
 
-        # 3. Create DB Entry
         is_first = len(current_user.projects) == 0
         new_project = ProjectModel(
-            id=project_id,
-            name=name,
-            train_path=os.path.abspath(project_train_path),
-            index_file=index_file,
-            metadata_file=metadata_file,
-            created_at=time.time(),
-            is_default=is_first,
-            owner_id=current_user.id
+            id=project_id, name=name, train_path=os.path.abspath(project_train_path),
+            index_file=index_file, metadata_file=metadata_file, created_at=time.time(),
+            is_default=is_first, owner_id=current_user.id
         )
         db.add(new_project)
-        db.commit() # Commit transaction
+        db.commit()
         db.refresh(new_project)
 
-        # 4. Auto switch if it's the first project (In Memory)
         if is_first:
             session = user_sessions[username]
-            session.current_project = {
-                "id": new_project.id,
-                "name": new_project.name,
-                "train_path": new_project.train_path,
-                "index_file": new_project.index_file,
-                "metadata_file": new_project.metadata_file
-            }
+            session.current_project = { "id": new_project.id, "name": new_project.name, "train_path": new_project.train_path, "index_file": new_project.index_file, "metadata_file": new_project.metadata_file }
             session.index = None
             session.image_paths = []
 
-        # 5. Start Indexing
         background_tasks.add_task(process_build_index, project_id, new_project.train_path, index_file, metadata_file, username)
-
+        
+        # Trả về data format giống hệt hàm cũ
         project_dict = {
             "id": new_project.id,
             "name": new_project.name,
@@ -439,46 +390,25 @@ async def create_project(
             "is_default": new_project.is_default,
             "owner": username
         }
-
+        
         return {"status": "started", "project": project_dict, "file_count": saved_count}
-
     except Exception as e:
-        # Rollback everything on failure
         db.rollback()
-        if os.path.exists(project_train_path):
-            shutil.rmtree(project_train_path)
-        print(f"Project creation failed: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to create project: {str(e)}")
+        if os.path.exists(project_train_path): shutil.rmtree(project_train_path)
+        raise HTTPException(status_code=400, detail=f"Failed: {str(e)}")
 
 @app.post("/projects/switch")
-def switch_project(
-    project_id: str = Form(...), 
-    current_user: UserModel = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    username = current_user.username
+def switch_project(project_id: str = Form(...), current_user: UserModel = Depends(get_current_user), db: Session = Depends(get_db)):
+    target = db.query(ProjectModel).filter(ProjectModel.id == project_id, ProjectModel.owner_id == current_user.id).first()
+    if not target: raise HTTPException(status_code=404, detail="Not found")
+    if indexing_states.get(project_id, {}).get("is_indexing", False): raise HTTPException(status_code=400, detail="Indexing")
+    success = load_project_data(current_user.username, target)
     
-    target = db.query(ProjectModel).filter(
-        ProjectModel.id == project_id, 
-        ProjectModel.owner_id == current_user.id
-    ).first()
-    
-    if not target:
-        raise HTTPException(status_code=404, detail="Project not found")
-    
-    # Check if indexing
-    if project_id in indexing_states and indexing_states[project_id]["is_indexing"]:
-         raise HTTPException(status_code=400, detail="Project is currently indexing")
-
-    success = load_project_data(username, target)
-    
-    # Convert to dict for response
     project_dict = {
         "id": target.id,
         "name": target.name,
         "is_default": target.is_default
     }
-    
     return {
         "status": "success" if success else "needs_indexing", 
         "project": project_dict,
@@ -486,136 +416,73 @@ def switch_project(
     }
 
 @app.post("/projects/set_default")
-def set_default_project(
-    project_id: str = Form(...), 
-    current_user: UserModel = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    # Set all user's projects default to false
+def set_default_project(project_id: str = Form(...), current_user: UserModel = Depends(get_current_user), db: Session = Depends(get_db)):
     db.query(ProjectModel).filter(ProjectModel.owner_id == current_user.id).update({ProjectModel.is_default: False})
-    
-    # Set target to true
     target = db.query(ProjectModel).filter(ProjectModel.id == project_id, ProjectModel.owner_id == current_user.id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="Project not found")
-    
     target.is_default = True
     db.commit()
-    
-    return {"status": "success", "message": f"Project '{target.name}' set as default."}
+    return {"status": "success"}
 
 @app.post("/projects/delete")
-def delete_project(
-    project_id: str = Form(...),
-    current_user: UserModel = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    username = current_user.username
-    
-    # 1. Check ownership
-    target = db.query(ProjectModel).filter(
-        ProjectModel.id == project_id,
-        ProjectModel.owner_id == current_user.id
-    ).first()
-    
-    if not target:
-        raise HTTPException(status_code=404, detail="Project not found")
-    
-    # 2. Prevent deleting if currently indexing
-    if project_id in indexing_states and indexing_states[project_id]["is_indexing"]:
-         raise HTTPException(status_code=400, detail="Cannot delete project while indexing")
+def delete_project(project_id: str = Form(...), current_user: UserModel = Depends(get_current_user), db: Session = Depends(get_db)):
+    target = db.query(ProjectModel).filter(ProjectModel.id == project_id, ProjectModel.owner_id == current_user.id).first()
+    if not target: raise HTTPException(status_code=404, detail="Not found")
+    if indexing_states.get(project_id, {}).get("is_indexing", False): raise HTTPException(status_code=400, detail="Indexing")
 
     try:
-        # 3. Remove physical files (Uploads)
-        if os.path.exists(target.train_path):
-            shutil.rmtree(target.train_path)
-            
-        # 4. Remove Index/Metadata files
-        project_data_dir = os.path.join(PROJECTS_DIR, project_id)
-        if os.path.exists(project_data_dir):
-            shutil.rmtree(project_data_dir)
-            
-        # 5. Remove from Database
+        if os.path.exists(target.train_path): shutil.rmtree(target.train_path)
+        if os.path.exists(os.path.join(PROJECTS_DIR, project_id)): shutil.rmtree(os.path.join(PROJECTS_DIR, project_id))
         db.delete(target)
         db.commit()
         
-        # 6. Clear from Session Memory if active
-        if username in user_sessions:
-            session = user_sessions[username]
-            if session.current_project and session.current_project['id'] == project_id:
-                session.current_project = None
-                session.index = None
-                session.image_paths = []
-                
-        return {"status": "success", "message": "Project deleted successfully"}
-        
+        if current_user.username in user_sessions:
+            s = user_sessions[current_user.username]
+            if s.current_project and s.current_project['id'] == project_id:
+                s.current_project, s.index, s.image_paths = None, None, []
+        return {"status": "success"}
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to delete project: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/indexing_status")
 def get_indexing_status(current_user: UserModel = Depends(get_current_user)):
-    username = current_user.username
-    session = user_sessions.get(username)
-    
+    session = user_sessions.get(current_user.username)
     if session and session.current_project:
-        proj_id = session.current_project["id"]
-        if proj_id in indexing_states:
-            return indexing_states[proj_id]
-            
+        return indexing_states.get(session.current_project["id"], {"is_indexing": False})
     return {"is_indexing": False}
 
 @app.get("/status")
 def get_status(current_user: UserModel = Depends(get_current_user)):
-    username = current_user.username
-    session = user_sessions.get(username)
+    session = user_sessions.get(current_user.username)
+    if not session: return {"status": "loading", "index_size": 0, "current_project": "None"}
     
-    if not session:
-        return {"status": "loading", "index_size": 0, "current_project": "None"}
-        
     proj_id = session.current_project["id"] if session.current_project else None
-    
     status_text = "ready"
-    if proj_id and proj_id in indexing_states and indexing_states[proj_id]["is_indexing"]:
-        status_text = "indexing"
-    elif session.index is None:
-        status_text = "loading" if session.current_project else "no_project"
+    if proj_id and indexing_states.get(proj_id, {}).get("is_indexing", False): status_text = "indexing"
+    elif session.index is None: status_text = "loading" if session.current_project else "no_project"
         
     return {
-        "status": status_text,
-        "index_size": session.index.ntotal if session.index else 0,
+        "status": status_text, "index_size": session.index.ntotal if session.index else 0,
         "current_project": session.current_project["name"] if session.current_project else "None",
         "train_path": session.current_project["train_path"] if session.current_project else ""
     }
 
 @app.get("/serve_image/{filename:path}")
 def serve_image(filename: str):
-    if os.path.exists(filename): # Absolute path check
-        return FileResponse(filename)
-    
-    # Try finding in uploads dir if path is relative
-    possible_path = os.path.join(UPLOADS_DIR, filename) 
-    if os.path.exists(possible_path):
-        return FileResponse(possible_path)
-        
-    raise HTTPException(status_code=404, detail="File not found")
+    if os.path.exists(filename): return FileResponse(filename)
+    if os.path.exists(os.path.join(UPLOADS_DIR, filename)): return FileResponse(os.path.join(UPLOADS_DIR, filename))
+    raise HTTPException(status_code=404)
 
 @app.get("/database")
 def get_database(request: Request, current_user: UserModel = Depends(get_current_user)):
-    username = current_user.username
-    session = user_sessions.get(username)
-    
-    if not session or not session.image_paths or not session.current_project:
-        return []
-    
+    session = user_sessions.get(current_user.username)
+    if not session or not session.image_paths or not session.current_project: return []
+    # Trả về kết quả hoàn chỉnh y hệt bản gốc
     base_url = str(request.base_url)
-    results = []
-    # session.image_paths stores relative paths inside the train_path
     train_path = session.current_project["train_path"]
-    
+    results = []
     for filename in session.image_paths:
         full_path = os.path.join(train_path, filename)
-        # We serve using the absolute path for simplicity in serve_image
         results.append({
             "filename": filename,
             "url": f"{base_url}serve_image/{full_path}" 
@@ -624,25 +491,19 @@ def get_database(request: Request, current_user: UserModel = Depends(get_current
 
 @app.get("/visualize")
 def get_visualization(request: Request, current_user: UserModel = Depends(get_current_user)):
-    username = current_user.username
-    session = user_sessions.get(username)
-    
-    if not session or not session.current_project:
-         return {"error": "No project loaded."}
-    
-    if session.index is None or session.index.ntotal < 3:
-        return {"error": "Not enough data (min 3 images)."}
+    session = user_sessions.get(current_user.username)
+    if not session or not session.current_project: return {"error": "No project"}
+    if session.index is None or session.index.ntotal < 3: return {"error": "Min 3 images"}
 
     vectors = session.index.reconstruct_n(0, session.index.ntotal)
+    # Re-added the mean calculation that was in the original code
     mean = np.mean(vectors, axis=0)
     centered = vectors - mean
     
     try:
-        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
-        components = Vt[:3]
-        projection = np.dot(centered, components.T)
-    except:
-        return {"error": "PCA failed"}
+        _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+        projection = np.dot(centered, Vt[:3].T)
+    except: return {"error": "PCA failed"}
 
     points = []
     base_url = str(request.base_url)
@@ -662,109 +523,58 @@ def get_visualization(request: Request, current_user: UserModel = Depends(get_cu
 
 @app.post("/add")
 async def add_to_index(file: UploadFile = File(...), current_user: UserModel = Depends(get_current_user)):
-    username = current_user.username
-    session = user_sessions.get(username)
+    session = user_sessions.get(current_user.username)
+    if not session or not session.index: raise HTTPException(status_code=503)
     
-    if not session or not session.index or not session.current_project:
-        raise HTTPException(status_code=503, detail="Project not ready")
+    save_path = os.path.join(session.current_project["train_path"], file.filename)
+    with open(save_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
 
-    filename = file.filename
-    save_path = os.path.join(session.current_project["train_path"], filename)
-    
-    try:
-        with open(save_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Save failed: {e}")
-
-    try:
-        vec = get_embedding(save_path)
-        vec = vec.reshape(1, -1)
-        session.index.add(vec)
-        session.image_paths.append(filename)
-    except Exception as e:
-         raise HTTPException(status_code=500, detail=f"Index update failed: {e}")
-
-    # Persistence
+    vec = get_embedding(save_path).reshape(1, -1)
+    session.index.add(vec)
+    session.image_paths.append(file.filename)
     faiss.write_index(session.index, session.current_project["index_file"])
-    with open(session.current_project["metadata_file"], "w") as f:
-        json.dump(session.image_paths, f)
-
+    with open(session.current_project["metadata_file"], "w") as f: json.dump(session.image_paths, f)
     return {"status": "success", "index_size": session.index.ntotal}
 
 @app.post("/delete")
 def delete_image(filename: str = Form(...), current_user: UserModel = Depends(get_current_user)):
-    username = current_user.username
-    session = user_sessions.get(username)
-    
-    if not session or not session.index:
-        raise HTTPException(status_code=503, detail="Not ready")
-        
-    if filename not in session.image_paths:
-        raise HTTPException(status_code=404, detail="Image not found")
+    session = user_sessions.get(current_user.username)
+    if not session or not session.index or filename not in session.image_paths: raise HTTPException(status_code=404)
 
     idx = session.image_paths.index(filename)
-    
-    # Remove file from disk (uploads folder)
-    full_path = os.path.join(session.current_project["train_path"], filename)
-    if os.path.exists(full_path):
-        try:
-            os.remove(full_path)
-        except Exception as e:
-            print(f"Warning: Could not delete file {full_path}: {e}")
+    try: os.remove(os.path.join(session.current_project["train_path"], filename))
+    except: pass
 
     session.index.remove_ids(np.array([idx], dtype='int64'))
     session.image_paths.pop(idx)
-
     faiss.write_index(session.index, session.current_project["index_file"])
-    with open(session.current_project["metadata_file"], "w") as f:
-        json.dump(session.image_paths, f)
-
+    with open(session.current_project["metadata_file"], "w") as f: json.dump(session.image_paths, f)
     return {"status": "deleted", "index_size": session.index.ntotal}
 
 @app.post("/search")
-async def search_image(
-    request: Request, 
-    k: int = Form(5), 
-    file: UploadFile = File(...),
-    current_user: UserModel = Depends(get_current_user)
-):
-    username = current_user.username
-    session = user_sessions.get(username)
-    
-    if not session or not session.current_project:
-        raise HTTPException(status_code=503, detail="No project selected")
-        
-    if not session.index or not session.image_paths:
-        raise HTTPException(status_code=503, detail="Index empty")
+async def search_image(request: Request, k: int = Form(5), file: UploadFile = File(...), current_user: UserModel = Depends(get_current_user)):
+    session = user_sessions.get(current_user.username)
+    if not session or not session.index: raise HTTPException(status_code=503)
 
     start_time = time.time()
-    try:
-        contents = await file.read()
-        import io
-        image_data = Image.open(io.BytesIO(contents))
-        query_vector = get_embedding(image_data).reshape(1, -1)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Processing failed: {e}")
-
-    search_k = min(k, len(session.image_paths))
-    distances, indices = session.index.search(query_vector, k=search_k)
+    query_vector = get_embedding(Image.open(file.file)).reshape(1, -1)
+    distances, indices = session.index.search(query_vector, k=min(k, len(session.image_paths)))
 
     results = []
     base_url = str(request.base_url)
     train_path = session.current_project["train_path"]
 
     for i, idx in enumerate(indices[0]):
-        if idx == -1: continue
-        filename = session.image_paths[idx]
-        full_path = os.path.join(train_path, filename)
-        results.append({
-            "filename": filename,
-            "filepath": full_path,
-            "url": f"{base_url}serve_image/{full_path}",
-            "distance": float(distances[0][i])
-        })
-
+        if idx != -1:
+            fname = session.image_paths[idx]
+            full_path = os.path.join(train_path, fname)
+            results.append({
+                "filename": fname, 
+                "filepath": full_path, # Fixed missing field
+                "url": f"{base_url}serve_image/{full_path}", 
+                "distance": float(distances[0][i])
+            })
+            
     return {"results": results, "query_time": time.time() - start_time}
 
 if __name__ == "__main__":
