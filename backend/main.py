@@ -137,13 +137,15 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 def load_model():
     global model
     model_path = os.environ.get("YOLO_MODEL_PATH", "yolov8n-cls.pt")
-    print(f"Loading YOLO model: {model_path}...")
+    print(f"Loading YOLO model: {model_path} on CPU...")
     try:
         model = YOLO(model_path)
+        model.to('cpu')
     except Exception as e:
         print(f"Error loading model: {e}. Fallback to 'yolov8n-cls.pt'")
         try:
             model = YOLO('yolov8n-cls.pt')
+            model.to('cpu')
         except:
             print("CRITICAL: Failed to load model")
             model = None
@@ -151,7 +153,10 @@ def load_model():
 def get_embedding(source):
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
-    results = model.embed(source)
+    
+    # Ép buộc inference bằng CPU để tránh lỗi CUDA
+    results = model.embed(source, device='cpu')
+    
     return results[0].cpu().numpy().astype('float32')
 
 def load_project_data(username: str, project: ProjectModel):
@@ -235,6 +240,7 @@ def process_build_index(project_id: str, train_path: str, index_file: str, metad
 
         state["current_step"] = "Building Index..."
         dataset_vectors = np.array(vectors)
+        
         new_index = faiss.IndexFlatL2(dataset_vectors.shape[1])
         new_index.add(dataset_vectors)
         
