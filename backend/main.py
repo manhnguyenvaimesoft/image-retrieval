@@ -32,7 +32,7 @@ ALGORITHM = os.environ.get("ALGORITHM")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", 1440)) 
 YOLO_MODEL_PATH = os.environ.get("YOLO_MODEL_PATH", "yolov8n-cls.pt")
 
-app = FastAPI(title="NeuroSearch API")
+app = FastAPI(title="AimeCADCAM API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -473,21 +473,69 @@ def serve_image(filename: str):
     if os.path.exists(os.path.join(UPLOADS_DIR, filename)): return FileResponse(os.path.join(UPLOADS_DIR, filename))
     raise HTTPException(status_code=404)
 
+# @app.get("/database")
+# def get_database(request: Request, current_user: UserModel = Depends(get_current_user)):
+#     session = user_sessions.get(current_user.username)
+#     if not session or not session.image_paths or not session.current_project: return []
+#     # Trả về kết quả hoàn chỉnh y hệt bản gốc
+#     base_url = str(request.base_url)
+#     train_path = session.current_project["train_path"]
+#     results = []
+#     for filename in session.image_paths:
+#         full_path = os.path.join(train_path, filename)
+#         results.append({
+#             "filename": filename,
+#             "url": f"{base_url}serve_image/{full_path}" 
+#         })
+#     return results
+
 @app.get("/database")
-def get_database(request: Request, current_user: UserModel = Depends(get_current_user)):
+def get_database(
+    request: Request, 
+    page: int = Query(1, ge=1, description="Trang hiện tại"),
+    limit: int = Query(50, ge=1, le=200, description="Số lượng ảnh mỗi trang"),
+    current_user: UserModel = Depends(get_current_user)
+):
     session = user_sessions.get(current_user.username)
-    if not session or not session.image_paths or not session.current_project: return []
-    # Trả về kết quả hoàn chỉnh y hệt bản gốc
+    
+    # Trả về format chuẩn phân trang nếu không có dữ liệu
+    if not session or not session.image_paths or not session.current_project: 
+        return {
+            "items": [],
+            "total": 0,
+            "page": page,
+            "limit": limit,
+            "total_pages": 0
+        }
+    
     base_url = str(request.base_url)
     train_path = session.current_project["train_path"]
+    
+    # Tính toán các thông số phân trang
+    total_items = len(session.image_paths)
+    total_pages = (total_items + limit - 1) // limit
+    
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    
+    # Cắt lấy đúng số phần tử của trang hiện tại
+    paginated_paths = session.image_paths[start_idx:end_idx]
+    
     results = []
-    for filename in session.image_paths:
+    for filename in paginated_paths:
         full_path = os.path.join(train_path, filename)
         results.append({
             "filename": filename,
             "url": f"{base_url}serve_image/{full_path}" 
         })
-    return results
+        
+    return {
+        "items": results,
+        "total": total_items,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages
+    }
 
 @app.get("/visualize")
 def get_visualization(request: Request, current_user: UserModel = Depends(get_current_user)):
@@ -495,8 +543,37 @@ def get_visualization(request: Request, current_user: UserModel = Depends(get_cu
     if not session or not session.current_project: return {"error": "No project"}
     if session.index is None or session.index.ntotal < 3: return {"error": "Min 3 images"}
 
+    train_path = session.current_project["train_path"]
+    base_url = str(request.base_url)
+    
+    # 1. Xác định đường dẫn file cache (lưu cùng chỗ với file index)
+    project_dir = os.path.dirname(session.current_project["index_file"])
+    cache_file = os.path.join(project_dir, "pca_cache.json")
+    
+    # 2. Thử đọc từ cache
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                cached_data = json.load(f)
+            
+            # Kiểm tra xem cache có bị cũ không (số lượng ảnh thay đổi)
+            if len(cached_data) == session.index.ntotal:
+                points = []
+                for item in cached_data:
+                    full_path = os.path.join(train_path, item["filename"])
+                    points.append({
+                        "filename": item["filename"],
+                        "url": f"{base_url}serve_image/{full_path}",
+                        "x": item["x"],
+                        "y": item["y"],
+                        "z": item["z"]
+                    })
+                return {"points": points}
+        except Exception as e:
+            print(f"Cache read error: {e}")
+
+    # 3. Tính toán PCA (Nếu không có cache hoặc cache không hợp lệ)
     vectors = session.index.reconstruct_n(0, session.index.ntotal)
-    # Re-added the mean calculation that was in the original code
     mean = np.mean(vectors, axis=0)
     centered = vectors - mean
     
@@ -506,19 +583,34 @@ def get_visualization(request: Request, current_user: UserModel = Depends(get_cu
     except: return {"error": "PCA failed"}
 
     points = []
-    base_url = str(request.base_url)
-    train_path = session.current_project["train_path"]
+    cache_data = [] # Data dùng để lưu trữ (không lưu URL vì URL có thể thay đổi theo host)
     
     for i, path in enumerate(session.image_paths):
         full_path = os.path.join(train_path, path)
+        x, y, z = float(projection[i, 0]), float(projection[i, 1]), float(projection[i, 2])
+        
         points.append({
             "filename": path,
             "url": f"{base_url}serve_image/{full_path}",
-            "x": float(projection[i, 0]),
-            "y": float(projection[i, 1]),
-            "z": float(projection[i, 2])
+            "x": x,
+            "y": y,
+            "z": z
         })
         
+        cache_data.append({
+            "filename": path,
+            "x": x,
+            "y": y,
+            "z": z
+        })
+        
+    # 4. Ghi kết quả mới ra file cache
+    try:
+        with open(cache_file, "w") as f:
+            json.dump(cache_data, f)
+    except Exception as e:
+        print(f"Cache write error: {e}")
+
     return {"points": points}
 
 @app.post("/add")
@@ -534,6 +626,13 @@ async def add_to_index(file: UploadFile = File(...), current_user: UserModel = D
     session.image_paths.append(file.filename)
     faiss.write_index(session.index, session.current_project["index_file"])
     with open(session.current_project["metadata_file"], "w") as f: json.dump(session.image_paths, f)
+    
+    # --- Xóa Cache PCA ---
+    cache_file = os.path.join(os.path.dirname(session.current_project["index_file"]), "pca_cache.json")
+    if os.path.exists(cache_file):
+        try: os.remove(cache_file)
+        except: pass
+        
     return {"status": "success", "index_size": session.index.ntotal}
 
 @app.post("/delete")
@@ -549,6 +648,13 @@ def delete_image(filename: str = Form(...), current_user: UserModel = Depends(ge
     session.image_paths.pop(idx)
     faiss.write_index(session.index, session.current_project["index_file"])
     with open(session.current_project["metadata_file"], "w") as f: json.dump(session.image_paths, f)
+    
+    # --- Xóa Cache PCA ---
+    cache_file = os.path.join(os.path.dirname(session.current_project["index_file"]), "pca_cache.json")
+    if os.path.exists(cache_file):
+        try: os.remove(cache_file)
+        except: pass
+
     return {"status": "deleted", "index_size": session.index.ntotal}
 
 @app.post("/search")

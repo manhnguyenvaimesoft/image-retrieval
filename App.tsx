@@ -269,48 +269,188 @@ const VectorSpace = ({ versionKey, onPointClick }: { versionKey: number, onPoint
   );
 };
 
+// const GalleryGrid = ({ onZoom, versionKey }: { onZoom: (item: any) => void, versionKey: number }) => {
+//   const [images, setImages] = useState<any[]>([]);
+//   const [loading, setLoading] = useState(true);
+//   const [error, setError] = useState<string|null>(null);
+
+//   useEffect(() => {
+//     setLoading(true);
+//     authFetch(`${API_BASE_URL}/database`)
+//       .then(res => {
+//         if (!res.ok) throw new Error("Failed to fetch gallery");
+//         return res.json();
+//       })
+//       .then(setData => setImages(setData))
+//       .catch(err => {
+//         console.error(err);
+//         setError("Failed to load images");
+//       })
+//       .finally(() => setLoading(false));
+//   }, [versionKey]);
+
+//   if (loading) return <div className="py-20 flex justify-center"><Loader2 className="w-8 h-8 animate-spin text-primary" /></div>;
+//   if (error) return <div className="py-20 flex justify-center text-rose-400">{error}</div>;
+
+//   return (
+//     <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
+//       {images.map((img, idx) => (
+//         <div 
+//           key={idx}
+//           onClick={() => onZoom(img)}
+//           className="aspect-square rounded-xl overflow-hidden border border-slate-800 relative group cursor-zoom-in bg-surface"
+//         >
+//           <img 
+//             src={img.url} 
+//             loading="lazy" 
+//             alt={img.filename} 
+//             className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-110" 
+//           />
+//           <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+//              <p className="text-xs text-white px-2 text-center truncate w-full">{img.filename}</p>
+//           </div>
+//         </div>
+//       ))}
+//     </div>
+//   );
+// };
+
 const GalleryGrid = ({ onZoom, versionKey }: { onZoom: (item: any) => void, versionKey: number }) => {
   const [images, setImages] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string|null>(null);
+  
+  // State quản lý phân trang
+  const [page, setPage] = useState(1);
+  const [limit, setLimit] = useState(50); // Mặc định 50 ảnh/trang
+  const [totalPages, setTotalPages] = useState(1);
+  const [totalItems, setTotalItems] = useState(0);
 
+  // Reset về trang 1 khi đổi project hoặc có dữ liệu mới
+  useEffect(() => {
+      setPage(1);
+  }, [versionKey]);
+
+  // Fetch dữ liệu mỗi khi page, limit hoặc versionKey thay đổi
   useEffect(() => {
     setLoading(true);
-    authFetch(`${API_BASE_URL}/database`)
+    authFetch(`${API_BASE_URL}/database?page=${page}&limit=${limit}`)
       .then(res => {
         if (!res.ok) throw new Error("Failed to fetch gallery");
         return res.json();
       })
-      .then(setData => setImages(setData))
+      .then(data => {
+          setImages(data.items || []);
+          setTotalPages(data.total_pages || 1);
+          setTotalItems(data.total || 0);
+      })
       .catch(err => {
         console.error(err);
         setError("Failed to load images");
       })
       .finally(() => setLoading(false));
-  }, [versionKey]);
+  }, [versionKey, page, limit]);
+
+  // Xử lý khi người dùng đổi số lượng ảnh trên trang
+  const handleLimitChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+      setLimit(Number(e.target.value));
+      setPage(1); // Luôn quay về trang 1 khi đổi limit để tránh lỗi
+  };
 
   if (loading) return <div className="py-20 flex justify-center"><Loader2 className="w-8 h-8 animate-spin text-primary" /></div>;
   if (error) return <div className="py-20 flex justify-center text-rose-400">{error}</div>;
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
-      {images.map((img, idx) => (
-        <div 
-          key={idx}
-          onClick={() => onZoom(img)}
-          className="aspect-square rounded-xl overflow-hidden border border-slate-800 relative group cursor-zoom-in bg-surface"
-        >
-          <img 
-            src={img.url} 
-            loading="lazy" 
-            alt={img.filename} 
-            className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-110" 
-          />
-          <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-             <p className="text-xs text-white px-2 text-center truncate w-full">{img.filename}</p>
-          </div>
+    <div className="space-y-6 animate-in fade-in duration-500">
+        
+        {/* Header Phân Trang & Tuỳ chọn Limit */}
+        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 text-sm text-slate-400 bg-slate-800/30 p-3 rounded-xl border border-slate-700/50">
+            <span>Showing <strong className="text-white">{images.length}</strong> of <strong className="text-white">{totalItems}</strong> images</span>
+            
+            <div className="flex items-center gap-3">
+                <label htmlFor="limit-select" className="font-medium">Items per page:</label>
+                <select 
+                    id="limit-select"
+                    value={limit}
+                    onChange={handleLimitChange}
+                    className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-white outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all cursor-pointer"
+                >
+                    <option value={5}>5</option>
+                    <option value={10}>10</option>
+                    <option value={20}>20</option>
+                    <option value={50}>50</option>
+                    <option value={100}>100</option>
+                    <option value={200}>200</option>
+                </select>
+            </div>
         </div>
-      ))}
+        
+        {images.length === 0 ? (
+            <div className="py-20 text-center text-slate-500">No images found in this project.</div>
+        ) : (
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
+              {images.map((img, idx) => (
+                <div 
+                  key={idx}
+                  onClick={() => onZoom(img)}
+                  className="aspect-square rounded-xl overflow-hidden border border-slate-800 relative group cursor-zoom-in bg-surface shadow-md hover:shadow-primary/20 transition-all"
+                >
+                  <img 
+                    src={img.url} 
+                    loading="lazy" 
+                    alt={img.filename} 
+                    className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-110" 
+                  />
+                  <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                     <p className="text-xs text-white px-2 text-center truncate w-full">{img.filename}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+        )}
+
+        {/* Cụm Nút Điều Hướng Phân Trang */}
+        {totalPages > 1 && (
+            <div className="flex flex-wrap items-center justify-center gap-2 sm:gap-4 pt-6 mt-8 border-t border-slate-800/50">
+                {/* Nút First (Về trang đầu) */}
+                <button 
+                    disabled={page === 1}
+                    onClick={() => setPage(1)}
+                    className="px-3 py-2 sm:px-4 flex items-center bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-sm font-medium"
+                >
+                    First
+                </button>
+
+                <button 
+                    disabled={page === 1}
+                    onClick={() => setPage(p => p - 1)}
+                    className="px-3 py-2 sm:px-4 flex items-center bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-sm font-medium"
+                >
+                    Previous
+                </button>
+                
+                <span className="text-sm text-slate-400 font-medium bg-slate-900/50 px-3 sm:px-4 py-2 rounded-lg border border-slate-800">
+                    Page <span className="text-white font-bold">{page}</span> of <span className="text-white font-bold">{totalPages}</span>
+                </span>
+                
+                <button 
+                    disabled={page >= totalPages}
+                    onClick={() => setPage(p => p + 1)}
+                    className="px-3 py-2 sm:px-4 flex items-center bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-sm font-medium"
+                >
+                    Next
+                </button>
+
+                {/* Nút Last (Đến trang cuối) */}
+                <button 
+                    disabled={page >= totalPages}
+                    onClick={() => setPage(totalPages)}
+                    className="px-3 py-2 sm:px-4 flex items-center bg-slate-800 text-slate-300 rounded-lg hover:bg-slate-700 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-sm font-medium"
+                >
+                    Last
+                </button>
+            </div>
+        )}
     </div>
   );
 };
