@@ -614,16 +614,26 @@ def get_visualization(request: Request, current_user: UserModel = Depends(get_cu
     return {"points": points}
 
 @app.post("/add")
-async def add_to_index(file: UploadFile = File(...), current_user: UserModel = Depends(get_current_user)):
+async def add_to_index(
+    file: UploadFile = File(...), 
+    custom_name: str = Form(None),
+    current_user: UserModel = Depends(get_current_user)
+):
     session = user_sessions.get(current_user.username)
     if not session or not session.index: raise HTTPException(status_code=503)
     
-    save_path = os.path.join(session.current_project["train_path"], file.filename)
+    final_name = custom_name.strip() if custom_name else file.filename
+    
+    # Kiểm tra trùng lặp tên trong database
+    if final_name in session.image_paths:
+        raise HTTPException(status_code=400, detail=f"The filename '{final_name}' already exists in the Project. Please rename it.")
+    
+    save_path = os.path.join(session.current_project["train_path"], final_name)
     with open(save_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
 
     vec = get_embedding(save_path).reshape(1, -1)
     session.index.add(vec)
-    session.image_paths.append(file.filename)
+    session.image_paths.append(final_name)
     faiss.write_index(session.index, session.current_project["index_file"])
     with open(session.current_project["metadata_file"], "w") as f: json.dump(session.image_paths, f)
     

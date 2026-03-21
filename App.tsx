@@ -502,6 +502,8 @@ export default function App() {
   const [uploadPreview, setUploadPreview] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [customFileName, setCustomFileName] = useState<string>("");
+  const [uploadErrorMsg, setUploadErrorMsg] = useState<string | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -798,21 +800,35 @@ export default function App() {
       const file = e.target.files[0];
       setUploadFile(file);
       setUploadPreview(URL.createObjectURL(file));
+      setCustomFileName(file.name); // Mặc định gán tên gốc của file
       setUploadStatus('idle');
+      setUploadErrorMsg(null); // Xóa lỗi cũ
     }
   };
 
   const handleAddToDatabase = async () => {
     if (!uploadFile) return;
+    if (!customFileName.trim()) {
+        setUploadStatus('error');
+        setUploadErrorMsg("Tên file không được để trống");
+        return;
+    }
+
     setIsUploading(true);
     setUploadStatus('idle');
+    setUploadErrorMsg(null);
 
     const formData = new FormData();
     formData.append('file', uploadFile);
+    formData.append('custom_name', customFileName); // Gửi tên mới lên server
 
     try {
       const res = await authFetch(`${API_BASE_URL}/add`, { method: 'POST', body: formData });
-      if (!res.ok) throw new Error("Upload failed");
+      
+      if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.detail || "Upload failed");
+      }
       
       const data = await res.json();
       setSystemStatus(prev => prev ? ({...prev, index_size: data.index_size}) : null);
@@ -823,11 +839,13 @@ export default function App() {
           setIsUploadModalOpen(false);
           setUploadFile(null);
           setUploadPreview(null);
+          setCustomFileName("");
           setUploadStatus('idle');
       }, 1500);
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
       setUploadStatus('error');
+      setUploadErrorMsg(err.message); // Hiển thị dòng chữ "Tên file đã tồn tại..."
     } finally {
       setIsUploading(false);
     }
@@ -1396,10 +1414,16 @@ export default function App() {
 
       {/* Upload/Add Modal */}
       {isUploadModalOpen && (
-         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in zoom-in-95 duration-200">
+         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in zoom-in-95 duration-200">
              <div className="bg-surface border border-slate-700 w-full max-w-md rounded-2xl p-6 shadow-2xl relative">
                  <button 
-                   onClick={() => setIsUploadModalOpen(false)}
+                   onClick={() => {
+                      setIsUploadModalOpen(false);
+                      setUploadFile(null);
+                      setUploadPreview(null);
+                      setUploadErrorMsg(null);
+                      setCustomFileName("");
+                   }}
                    className="absolute top-4 right-4 text-slate-400 hover:text-white"
                    disabled={isUploading}
                  >
@@ -1433,14 +1457,30 @@ export default function App() {
                      </div>
                    )}
                  </div>
+
+                 {/* Ô nhập liệu hiện ra khi có ảnh để người dùng dễ đổi tên */}
+                 {uploadPreview && (
+                     <div className="mb-4">
+                         <label className="block text-xs font-medium text-slate-400 mb-1">File Name</label>
+                         <input 
+                             type="text" 
+                             value={customFileName}
+                             onChange={(e) => setCustomFileName(e.target.value)}
+                             className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all"
+                             disabled={isUploading}
+                         />
+                     </div>
+                 )}
+
                  {uploadStatus === 'error' && (
-                    <p className="text-rose-400 text-sm mb-4 flex items-center gap-2">
-                        <AlertCircle className="w-4 h-4" /> Upload failed. Try again.
+                    <p className="text-rose-400 text-sm mb-4 flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /> 
+                        <span>{uploadErrorMsg || "Upload failed. Try again."}</span>
                     </p>
                  )}
                  <button
                     onClick={handleAddToDatabase}
-                    disabled={!uploadFile || isUploading || uploadStatus === 'success'}
+                    disabled={!uploadFile || isUploading || uploadStatus === 'success' || !customFileName.trim()}
                     className={cn(
                         "w-full py-2.5 rounded-xl font-semibold flex items-center justify-center gap-2 transition-all",
                         uploadStatus === 'success' ? "bg-emerald-500 text-white" : "bg-primary hover:bg-secondary text-white disabled:opacity-50 disabled:cursor-not-allowed"
