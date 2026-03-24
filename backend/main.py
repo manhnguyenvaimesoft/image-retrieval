@@ -545,18 +545,18 @@ def get_visualization(request: Request, current_user: UserModel = Depends(get_cu
 
     train_path = session.current_project["train_path"]
     base_url = str(request.base_url)
-    
-    # 1. Xác định đường dẫn file cache (lưu cùng chỗ với file index)
     project_dir = os.path.dirname(session.current_project["index_file"])
-    cache_file = os.path.join(project_dir, "pca_cache.json")
     
-    # 2. Thử đọc từ cache
+    cache_file = os.path.join(project_dir, "pca_cache.json")
+    model_file = os.path.join(project_dir, "pca_model.npz")
+    
+    # 1. Thử đọc từ Cache
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r") as f:
                 cached_data = json.load(f)
             
-            # Kiểm tra xem cache có bị cũ không (số lượng ảnh thay đổi)
+            # Chỉ dùng cache nếu số lượng khớp với index (đảm bảo tính đồng bộ)
             if len(cached_data) == session.index.ntotal:
                 points = []
                 for item in cached_data:
@@ -564,26 +564,26 @@ def get_visualization(request: Request, current_user: UserModel = Depends(get_cu
                     points.append({
                         "filename": item["filename"],
                         "url": f"{base_url}serve_image/{full_path}",
-                        "x": item["x"],
-                        "y": item["y"],
-                        "z": item["z"]
+                        "x": item["x"], "y": item["y"], "z": item["z"]
                     })
                 return {"points": points}
         except Exception as e:
             print(f"Cache read error: {e}")
 
-    # 3. Tính toán PCA (Nếu không có cache hoặc cache không hợp lệ)
+    # 2. Tính toán SVD (Chỉ chạy khi không có cache)
     vectors = session.index.reconstruct_n(0, session.index.ntotal)
     mean = np.mean(vectors, axis=0)
     centered = vectors - mean
     
     try:
         _, _, Vt = np.linalg.svd(centered, full_matrices=False)
-        projection = np.dot(centered, Vt[:3].T)
+        components = Vt[:3]
+        projection = np.dot(centered, components.T)
     except: return {"error": "PCA failed"}
 
+    # 3. Lưu Model (mean, components) và Cache (points)
     points = []
-    cache_data = [] # Data dùng để lưu trữ (không lưu URL vì URL có thể thay đổi theo host)
+    cache_data = []
     
     for i, path in enumerate(session.image_paths):
         full_path = os.path.join(train_path, path)
@@ -592,24 +592,16 @@ def get_visualization(request: Request, current_user: UserModel = Depends(get_cu
         points.append({
             "filename": path,
             "url": f"{base_url}serve_image/{full_path}",
-            "x": x,
-            "y": y,
-            "z": z
+            "x": x, "y": y, "z": z
         })
+        cache_data.append({"filename": path, "x": x, "y": y, "z": z})
         
-        cache_data.append({
-            "filename": path,
-            "x": x,
-            "y": y,
-            "z": z
-        })
-        
-    # 4. Ghi kết quả mới ra file cache
     try:
+        np.savez(model_file, mean=mean, components=components) # Lưu model chiếu
         with open(cache_file, "w") as f:
-            json.dump(cache_data, f)
+            json.dump(cache_data, f) # Lưu tọa độ tĩnh
     except Exception as e:
-        print(f"Cache write error: {e}")
+        print(f"Failed to save SVD models: {e}")
 
     return {"points": points}
 
@@ -637,12 +629,41 @@ async def add_to_index(
     faiss.write_index(session.index, session.current_project["index_file"])
     with open(session.current_project["metadata_file"], "w") as f: json.dump(session.image_paths, f)
     
-    # --- Xóa Cache PCA ---
-    cache_file = os.path.join(os.path.dirname(session.current_project["index_file"]), "pca_cache.json")
-    if os.path.exists(cache_file):
-        try: os.remove(cache_file)
-        except: pass
-        
+    # --- ÁP DỤNG INCREMENTAL PROJECTION ---
+    project_dir = os.path.dirname(session.current_project["index_file"])
+    cache_file = os.path.join(project_dir, "pca_cache.json")
+    model_file = os.path.join(project_dir, "pca_model.npz")
+
+    if os.path.exists(cache_file) and os.path.exists(model_file):
+        try:
+            # 1. Load SVD Model cũ
+            pca_model = np.load(model_file)
+            mean = pca_model['mean']
+            components = pca_model['components']
+
+            # 2. Chiếu điểm mới vào không gian 3D cũ (O(1) time)
+            new_centered = vec[0] - mean
+            new_proj = np.dot(new_centered, components.T)
+
+            # 3. Nối điểm mới vào Cache
+            with open(cache_file, "r") as f:
+                cached_data = json.load(f)
+
+            cached_data.append({
+                "filename": final_name,
+                "x": float(new_proj[0]),
+                "y": float(new_proj[1]),
+                "z": float(new_proj[2])
+            })
+
+            with open(cache_file, "w") as f:
+                json.dump(cached_data, f)
+        except Exception as e:
+            print(f"Incremental Projection failed: {e}")
+            # Rơi vào lỗi -> Xóa cache để ép tính lại ở lần xem tiếp theo
+            try: os.remove(cache_file)
+            except: pass
+            
     return {"status": "success", "index_size": session.index.ntotal}
 
 @app.post("/delete")
@@ -659,8 +680,9 @@ def delete_image(filename: str = Form(...), current_user: UserModel = Depends(ge
     faiss.write_index(session.index, session.current_project["index_file"])
     with open(session.current_project["metadata_file"], "w") as f: json.dump(session.image_paths, f)
     
-    # --- Xóa Cache PCA ---
-    cache_file = os.path.join(os.path.dirname(session.current_project["index_file"]), "pca_cache.json")
+    # --- Xóa Cache để ép phục hồi lại chuẩn không gian SVD ---
+    project_dir = os.path.dirname(session.current_project["index_file"])
+    cache_file = os.path.join(project_dir, "pca_cache.json")
     if os.path.exists(cache_file):
         try: os.remove(cache_file)
         except: pass
