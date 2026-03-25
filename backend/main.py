@@ -620,6 +620,11 @@ async def add_to_index(
     if final_name in session.image_paths:
         raise HTTPException(status_code=400, detail=f"The filename '{final_name}' already exists in the Project. Please rename it.")
     
+    # kiểm tra định dạng file
+    ext = os.path.splitext(final_name)[1].lower()
+    if ext not in ('.png', '.jpg', '.jpeg', '.bmp', '.webp'):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Allowed: .png, .jpg, .jpeg, .bmp, .webp")
+
     save_path = os.path.join(session.current_project["train_path"], final_name)
     with open(save_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
 

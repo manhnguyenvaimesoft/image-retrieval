@@ -1142,7 +1142,7 @@ export default function App() {
                                 <Upload className="w-6 h-6 text-slate-300" />
                             </div>
                             <p className="text-slate-300 font-medium">Click to upload image</p>
-                            <p className="text-slate-500 text-xs mt-1">PNG, JPG support</p>
+                            <p className="text-slate-500 text-xs mt-1">PNG, JPG, JPEG, BMP, WEBP support</p>
                             </div>
                         )}
                         </div>
